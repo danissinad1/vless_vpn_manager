@@ -267,13 +267,20 @@ def list_links():
     print(f"\nНепустых записей: {count}; уникальных: {unique}; дубликатов: {duplicates}")
 
 
+def normalize_pasted_link(value):
+    """Remove the URL annotation produced when a link is copied from chat."""
+    value = value.strip()
+    match = re.fullmatch(r"@url:`(https?://[^`]+)`", value, flags=re.IGNORECASE)
+    return match.group(1) if match else value
+
+
 def add_links():
     print("Вставляйте VLESS-ссылки или HTTP(S)-ссылки подписки по одной на строку.")
     print("Поддерживаются обычные и Base64-кодированные подписки. Пустая строка завершает ввод.")
     added = []
     while True:
         try:
-            raw = safe_input("ссылка> ").strip()
+            raw = normalize_pasted_link(safe_input("ссылка> "))
         except EOFError:
             break
         if not raw:

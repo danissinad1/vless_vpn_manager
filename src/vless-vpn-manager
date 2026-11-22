@@ -390,21 +390,11 @@ def extract_subscription_links(payload, with_rejected=False):
 
 
 def subscription_hwid():
-    """Return a stable random device ID required by device-limited subscriptions."""
-    path = STATE_DIR / "subscription-hwid"
-    if path.exists():
-        value = path.read_text().strip().lower()
-        try:
-            return str(uuid.UUID(value))
-        except ValueError as exc:
-            raise ValueError(f"некорректный идентификатор подписки в {path}") from exc
-
-    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    value = str(uuid.uuid4())
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w") as output:
-        output.write(value + "\n")
-    return value
+    """Derive a stable UUID from the computer name for subscription requests."""
+    hostname = socket.gethostname().strip().lower()
+    if not hostname:
+        raise ValueError("не удалось определить имя компьютера для HWID")
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, hostname))
 
 
 def fetch_subscription(url, with_rejected=False):

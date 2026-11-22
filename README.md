@@ -37,7 +37,7 @@ VLESS VPN Manager ──► проверка каждого узла
       ▼
 выбор рабочих узлов
       ├─ Reality/TCP и TLS/TCP ──► sing-box
-      └─ XHTTP/TLS ──────────────► Xray (xray-hermes)
+      └─ XHTTP/TLS ──────────────► Xray (xray)
                                       │
                                       ▼
                               локальные SOCKS-outbound
@@ -90,8 +90,9 @@ sudo ./install.sh
 | Генератор конфигураций | `/usr/local/sbin/update-remnawave-nodes` |
 | Список VLESS-ссылок | `/etc/vless-vpn-manager/links.txt` |
 | Конфигурация sing-box | `/etc/sing-box/config.json` |
-| Конфигурация Xray | `/etc/xray-hermes/config.json` |
-| systemd-unit Xray | `/etc/systemd/system/xray-hermes.service` |
+| Конфигурация Xray | `/etc/xray/config.json` |
+| Бинарник Xray | `/usr/local/bin/xray` |
+| systemd-unit Xray | `/etc/systemd/system/xray.service` |
 | Состояние менеджера | `/var/lib/vless-vpn-manager` |
 | Резервные копии | `/root/vless-vpn-backups` |
 
@@ -132,7 +133,7 @@ sudo ./install.sh
 
 ```bash
 journalctl -u sing-box
-journalctl -u xray-hermes
+journalctl -u xray
 ```
 
 Также выводит команды проверки конфигураций и перезапуска сервисов. Используйте, если сервис имеет состояние `failed` или диагностика обнаружила ошибку.
@@ -216,6 +217,14 @@ journalctl -u xray-hermes
 
 Восстанавливает отсутствующие базовые конфиги, systemd-unit Xray и автозапуск сервисов. После исправления запускается диагностика.
 
+При обнаружении старой установки менеджера этот пункт создаёт снимок и мигрирует Xray со старых имён на стандартные:
+
+- `xray-hermes.service` → `xray.service`;
+- `/usr/local/bin/xray-hermes` → `/usr/local/bin/xray`;
+- `/etc/xray-hermes` → `/etc/xray`.
+
+Активность и автозапуск старой службы сохраняются. Если одновременно существуют старые и новые пути, миграция останавливается без перезаписи файлов.
+
 Этот пункт не устанавливает отсутствующие бинарники. Для полной установки используйте пункт **10**.
 
 ### 🔟 Чистая переустановка VPN
@@ -244,6 +253,21 @@ journalctl -u xray-hermes
 ```
 
 Существующие ссылки сохраняются. При ошибке предыдущая конфигурация восстанавливается автоматически. Операция временно прерывает VPN-соединение.
+
+### 1️⃣4️⃣ Управление службами и автозапуском
+
+Открывает отдельное подменю для `sing-box.service` и `xray.service`. Для каждой установленной службы доступны:
+
+- запуск;
+- остановка;
+- перезапуск;
+- включение автозапуска;
+- отключение автозапуска.
+
+Текущее состояние службы и автозапуска показывается зелёным или красным цветом. Перед первым изменением менеджер создаёт снимок, поэтому действия текущего запуска можно отменить пунктом **12**.
+
+> [!WARNING]
+> Остановка `sing-box` или `xray` может немедленно прервать VPN-трафик. Отключение автозапуска не останавливает уже работающую службу.
 
 ### 1️⃣1️⃣ Полностью удалить VPN
 
@@ -348,8 +372,9 @@ journalctl -u xray-hermes
 | `VLESS_LINKS_FILE` | `/etc/vless-vpn-manager/links.txt` |
 | `VLESS_MANAGER_CORE` | `/usr/local/sbin/update-remnawave-nodes` |
 | `VLESS_SING_CONFIG` | `/etc/sing-box/config.json` |
-| `VLESS_XRAY_CONFIG` | `/etc/xray-hermes/config.json` |
-| `VLESS_XRAY_UNIT` | `/etc/systemd/system/xray-hermes.service` |
+| `VLESS_XRAY_CONFIG` | `/etc/xray/config.json` |
+| `VLESS_XRAY_UNIT` | `/etc/systemd/system/xray.service` |
+| `VLESS_XRAY_BIN` | `/usr/local/bin/xray` |
 | `VLESS_STATE_DIR` | `/var/lib/vless-vpn-manager` |
 | `VLESS_BACKUP_DIR` | `/root/vless-vpn-backups` |
 | `VLESS_MANAGER_LOCK_FILE` | `/run/lock/vless-vpn-manager.lock` |
@@ -399,9 +424,9 @@ Smoke-тест не изменяет системную конфигурацию
 
 ```bash
 sudo sing-box check -c /etc/sing-box/config.json
-sudo /usr/local/bin/xray-hermes run -test -c /etc/xray-hermes/config.json
-sudo systemctl status sing-box xray-hermes --no-pager
-sudo journalctl -u sing-box -u xray-hermes -n 100 --no-pager
+sudo /usr/local/bin/xray run -test -c /etc/xray/config.json
+sudo systemctl status sing-box xray --no-pager
+sudo journalctl -u sing-box -u xray -n 100 --no-pager
 ```
 
 ## ⚠️ Ограничения

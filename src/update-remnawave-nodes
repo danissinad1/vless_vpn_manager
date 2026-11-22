@@ -18,9 +18,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 SOURCE = Path(os.environ.get("VLESS_LINKS_FILE", "/etc/vless-vpn-manager/links.txt"))
 SING_CONFIG = Path(os.environ.get("VLESS_SING_CONFIG", "/etc/sing-box/config.json"))
-XRAY_CONFIG = Path(os.environ.get("VLESS_XRAY_CONFIG", "/etc/xray-hermes/config.json"))
+XRAY_CONFIG = Path(os.environ.get("VLESS_XRAY_CONFIG", "/etc/xray/config.json"))
 SING_BIN = "/usr/bin/sing-box"
-XRAY_BIN = "/usr/local/bin/xray-hermes"
+XRAY_BIN = os.environ.get("VLESS_XRAY_BIN", "/usr/local/bin/xray")
 LOCK = Path(os.environ.get("VLESS_CORE_LOCK_FILE", "/run/lock/update-remnawave-nodes.lock"))
 SOCKS_PORT_BASE = 19081
 PROBE_PORT_BASE = 21000
@@ -369,7 +369,7 @@ def apply_configs(sing, xray, have_xhttp):
     rollback_unit = f"remnawave-rollback-{stamp}"
     sing_backup = SING_CONFIG.with_name(f"config.json.bak-{stamp}")
     xray_backup = XRAY_CONFIG.with_name(f"config.json.bak-{stamp}")
-    xray_was_active = subprocess.run(["systemctl", "is-active", "--quiet", "xray-hermes.service"]).returncode == 0
+    xray_was_active = subprocess.run(["systemctl", "is-active", "--quiet", "xray.service"]).returncode == 0
     shutil.copy2(SING_CONFIG, sing_backup)
     if XRAY_CONFIG.exists():
         shutil.copy2(XRAY_CONFIG, xray_backup)
@@ -378,7 +378,7 @@ def apply_configs(sing, xray, have_xhttp):
         f"cp -a {sing_backup} {SING_CONFIG}",
         f"cp -a {xray_backup} {XRAY_CONFIG}" if xray_backup.exists() else ":",
         "systemctl restart sing-box.service",
-        "systemctl restart xray-hermes.service" if xray_was_active else "systemctl stop xray-hermes.service",
+        "systemctl restart xray.service" if xray_was_active else "systemctl stop xray.service",
     ]
     run([
         "systemd-run", f"--unit={rollback_unit}", "--on-active=90s",
@@ -396,13 +396,13 @@ def apply_configs(sing, xray, have_xhttp):
         os.replace(xray_tmp, XRAY_CONFIG)
         os.replace(sing_tmp, SING_CONFIG)
         if have_xhttp:
-            run(["systemctl", "restart", "xray-hermes.service"])
+            run(["systemctl", "restart", "xray.service"])
         else:
-            run(["systemctl", "stop", "xray-hermes.service"])
+            run(["systemctl", "stop", "xray.service"])
         run(["systemctl", "restart", "sing-box.service"])
         run(["systemctl", "is-active", "sing-box.service"])
         if have_xhttp:
-            run(["systemctl", "is-active", "xray-hermes.service"])
+            run(["systemctl", "is-active", "xray.service"])
         online = False
         for _ in range(10):
             check = subprocess.run(
@@ -423,9 +423,9 @@ def apply_configs(sing, xray, have_xhttp):
         if xray_backup.exists():
             shutil.copy2(xray_backup, XRAY_CONFIG)
         if xray_was_active:
-            subprocess.run(["systemctl", "restart", "xray-hermes.service"])
+            subprocess.run(["systemctl", "restart", "xray.service"])
         else:
-            subprocess.run(["systemctl", "stop", "xray-hermes.service"])
+            subprocess.run(["systemctl", "stop", "xray.service"])
         subprocess.run(["systemctl", "restart", "sing-box.service"])
         subprocess.run(["systemctl", "stop", f"{rollback_unit}.timer"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         raise

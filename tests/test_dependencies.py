@@ -252,6 +252,116 @@ class ConnectivityTests(unittest.TestCase):
         self.assertEqual([item["state"] for item in results], ["available", "restricted", "failed"])
 
 
+class ServiceManagementTests(unittest.TestCase):
+    def test_xray_uses_standard_paths_and_service_name(self):
+        self.assertEqual(MANAGER.XRAY_CONFIG, Path("/etc/xray/config.json"))
+        self.assertEqual(MANAGER.XRAY_UNIT, Path("/etc/systemd/system/xray.service"))
+        self.assertEqual(MANAGER.XRAY_BIN, Path("/usr/local/bin/xray"))
+        unit = MANAGER.xray_service_unit()
+        self.assertIn("LoadCredential=config.json:/etc/xray/config.json", unit)
+        self.assertIn("ExecStart=/usr/local/bin/xray run -c %d/config.json", unit)
+
+    def test_service_control_creates_backup_runs_action_and_verifies_state(self):
+        calls = []
+        backups = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return FakeResult()
+
+        state = MANAGER.control_service(
+            "xray.service",
+            "disable",
+            run_command=fake_run,
+            state_reader=lambda _service: ("active", "disabled"),
+            backup=lambda: backups.append(True),
+        )
+
+        self.assertEqual(backups, [True])
+        self.assertEqual(calls, [(["systemctl", "disable", "xray.service"], {"check": True})])
+        self.assertEqual(state, ("active", "disabled"))
+
+    def test_rejects_unknown_service_or_action(self):
+        with self.assertRaisesRegex(ValueError, "служба"):
+            MANAGER.control_service("ssh.service", "start")
+        with self.assertRaisesRegex(ValueError, "действие"):
+            MANAGER.control_service("xray.service", "mask")
+
+    def test_migrates_legacy_xray_installation_and_preserves_service_state(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return FakeResult()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_config = root / "etc/xray-hermes"
+            legacy_config.mkdir(parents=True)
+            (legacy_config / "config.json").write_text("{}\n")
+            legacy_bin = root / "usr/local/bin/xray-hermes"
+            legacy_bin.parent.mkdir(parents=True)
+            legacy_bin.write_text("binary")
+            legacy_unit = root / "etc/systemd/system/xray-hermes.service"
+            legacy_unit.parent.mkdir(parents=True)
+            legacy_unit.write_text("legacy")
+            new_config = root / "etc/xray/config.json"
+            new_bin = root / "usr/local/bin/xray"
+            new_unit = root / "etc/systemd/system/xray.service"
+
+            with patch.multiple(
+                MANAGER,
+                LEGACY_XRAY_CONFIG_DIR=legacy_config,
+                LEGACY_XRAY_BIN=legacy_bin,
+                LEGACY_XRAY_UNIT=legacy_unit,
+                XRAY_CONFIG=new_config,
+                XRAY_BIN=new_bin,
+                XRAY_UNIT=new_unit,
+            ):
+                migrated = MANAGER.migrate_legacy_xray(
+                    run_command=fake_run,
+                    state_reader=lambda _service: ("active", "enabled"),
+                )
+
+            self.assertTrue(migrated)
+            self.assertEqual(new_config.read_text(), "{}\n")
+            self.assertEqual(new_bin.read_text(), "binary")
+            self.assertIn(f"ExecStart={new_bin}", new_unit.read_text())
+            self.assertFalse(legacy_config.exists())
+            self.assertFalse(legacy_bin.exists())
+            self.assertFalse(legacy_unit.exists())
+            self.assertIn(["systemctl", "stop", "xray-hermes.service"], calls)
+            self.assertIn(["systemctl", "enable", "xray.service"], calls)
+            self.assertIn(["systemctl", "restart", "xray.service"], calls)
+    def test_migration_rejects_conflicting_old_and_new_paths(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_config = root / "etc/xray-hermes"
+            current_config = root / "etc/xray"
+            legacy_config.mkdir(parents=True)
+            current_config.mkdir(parents=True)
+            (legacy_config / "config.json").write_text("old")
+            (current_config / "config.json").write_text("new")
+            with patch.multiple(
+                MANAGER,
+                LEGACY_XRAY_CONFIG_DIR=legacy_config,
+                LEGACY_XRAY_BIN=root / "usr/local/bin/xray-hermes",
+                LEGACY_XRAY_UNIT=root / "etc/systemd/system/xray-hermes.service",
+                XRAY_CONFIG=current_config / "config.json",
+                XRAY_BIN=root / "usr/local/bin/xray",
+                XRAY_UNIT=root / "etc/systemd/system/xray.service",
+            ):
+                with self.assertRaisesRegex(RuntimeError, "конфликтующие"):
+                    MANAGER.migrate_legacy_xray(
+                        run_command=lambda command, **_kwargs: calls.append(command),
+                        state_reader=lambda _service: ("active", "enabled"),
+                    )
+            self.assertEqual(calls, [])
+            self.assertEqual((legacy_config / "config.json").read_text(), "old")
+            self.assertEqual((current_config / "config.json").read_text(), "new")
+
+
 class RoutingTests(unittest.TestCase):
     def test_xray_service_can_set_bypass_socket_mark(self):
         unit = MANAGER.xray_service_unit()

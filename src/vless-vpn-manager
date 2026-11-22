@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""Interactive VLESS VPN manager for sing-box + Xray XHTTP."""
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import fcntl
+import importlib.machinery
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+import zipfile
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+CORE = Path(os.environ.get("VLESS_MANAGER_CORE", "/usr/local/sbin/update-remnawave-nodes"))
+SOURCE = Path(os.environ.get("VLESS_LINKS_FILE", "/etc/vless-vpn-manager/links.txt"))
+SING_CONFIG = Path(os.environ.get("VLESS_SING_CONFIG", "/etc/sing-box/config.json"))
+XRAY_CONFIG = Path(os.environ.get("VLESS_XRAY_CONFIG", "/etc/xray-hermes/config.json"))
+XRAY_UNIT = Path(os.environ.get("VLESS_XRAY_UNIT", "/etc/systemd/system/xray-hermes.service"))
+STATE_DIR = Path(os.environ.get("VLESS_STATE_DIR", "/var/lib/vless-vpn-manager"))
+BACKUP_DIR = Path(os.environ.get("VLESS_BACKUP_DIR", "/root/vless-vpn-backups"))
+RESULTS_FILE = STATE_DIR / "last-results.json"
+SESSION_BACKUP = None
+LOCK_FILE = Path(os.environ.get("VLESS_MANAGER_LOCK_FILE", "/run/lock/vless-vpn-manager.lock"))
+CHATGPT_URL = "https://chatgpt.com/backend-api/codex"
+GEMINI_URL = "https://gemini.google.com/app"
+EXPECTED_CHATGPT = "404"
+EXPECTED_GEMINI = "200"
+
+C_RESET = "\033[0m"
+C_RED = "\033[31m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_CYAN = "\033[36m"
+C_BLUE = "\033[34m"
+C_MAGENTA = "\033[35m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[2m"
+
+
+def color(text, code):
+    return f"{code}{text}{C_RESET}" if sys.stdout.isatty() else text
+
+
+def ok(text):
+    print(color(f"[OK] {text}", C_GREEN))
+
+
+def warn(text):
+    print(color(f"[WARN] {text}", C_YELLOW))
+
+
+def fail(text):
+    print(color(f"[FAIL] {text}", C_RED))
+
+
+def info(text):
+    print(color(f"[INFO] {text}", C_CYAN))
+
+
+def heading(text):
+    line = "─" * max(24, len(text) + 4)
+    print(color(f"\n┌{line}┐\n│  {text:<{len(line)-2}}│\n└{line}┘", C_BOLD + C_BLUE))
+
+
+def status_text(value, positive="ДА", negative="НЕТ"):
+    return color(f"● {positive}", C_GREEN + C_BOLD) if value else color(f"● {negative}", C_RED + C_BOLD)
+
+
+def confirm_phrase(description, phrase):
+    print(color(f"\nВНИМАНИЕ: {description}", C_RED + C_BOLD))
+    entered = safe_input(f"Для подтверждения введите точно: {phrase}\n> ").strip()
+    return entered == phrase
+
+
+def safe_input(prompt=""):
+    """Read terminal bytes safely after partial UTF-8 backspace edits."""
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:
+        return input(prompt)
+    print(prompt, end="", flush=True)
+    raw = stream.readline()
+    if raw == b"":
+        raise EOFError
+    # In canonical TTY mode Backspace may remove only one byte of a
+    # two-byte Cyrillic character. Ignore only the orphaned invalid byte.
+    return raw.decode("utf-8", errors="ignore").rstrip("\r\n")
+
+
+def clear_screen():
+    if sys.stdout.isatty():
+        print("\033[2J\033[H", end="", flush=True)
+
+
+def pause_before_menu():
+    try:
+        safe_input(color("\nНажмите Enter, чтобы вернуться в главное меню…", C_DIM))
+    except EOFError:
+        pass
+
+
+def run(cmd, check=False, timeout=60):
+    result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    if check and result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"{' '.join(cmd)}: {detail or 'код ' + str(result.returncode)}")
+    return result
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise RuntimeError("запустите скрипт от root: sudo vless-vpn-manager")
+
+
+def load_core():
+    if not CORE.is_file():
+        raise RuntimeError(f"не найден модуль генерации {CORE}")
+    return importlib.machinery.SourceFileLoader("vless_vpn_core", str(CORE)).load_module()
+
+
+def protocol_name(item, kind=None):
+    if kind == "xhttp" or item.get("transport") == "xhttp":
+        return "XHTTP/TLS"
+    if item.get("security") == "reality":
+        return "Reality/TCP"
+    return "TLS/TCP"
+
+
+def summarize_uri(raw):
+    uri = urlparse(raw.strip())
+    q = parse_qs(uri.query)
+    security = q.get("security", [""])[0].lower()
+    transport = q.get("type", ["tcp"])[0].lower()
+    if transport == "raw":
+        transport = "tcp"
+    if uri.scheme.lower() != "vless" or not uri.hostname or not uri.port or not uri.username:
+        raise ValueError("неполная VLESS-ссылка")
+    if transport == "xhttp" and security == "tls":
+        proto = "XHTTP/TLS"
+    elif transport == "tcp" and security == "reality":
+        if not q.get("pbk", [""])[0]:
+            raise ValueError("Reality без pbk")
+        proto = "Reality/TCP"
+    elif transport == "tcp" and security == "tls":
+        proto = "TLS/TCP"
+    else:
+        raise ValueError(f"неподдерживаемая комбинация {security}/{transport}")
+    return proto, uri.hostname, uri.port
+
+
+def source_lines():
+    return SOURCE.read_text().splitlines() if SOURCE.exists() else []
+
+
+def short_version(command):
+    try:
+        result = run(command, timeout=10)
+        return (result.stdout or result.stderr).splitlines()[0].strip() or "неизвестно"
+    except Exception:
+        return "не установлен"
+
+
+def dashboard():
+    """Compact live overview; no configuration changes."""
+    heading("VLESS VPN MANAGER")
+    host = socket.gethostname()
+    sing_active, sing_enabled = service_state("sing-box.service")
+    xray_active, xray_enabled = service_state("xray-hermes.service")
+    raw_links = [x.strip() for x in source_lines() if x.strip() and not x.strip().startswith("#")]
+    unique_links = len(set(raw_links))
+    active_nodes = 0
+    try:
+        config = json.loads(SING_CONFIG.read_text())
+        selector = next(x for x in config.get("outbounds", []) if x.get("tag") == "vpn-auto")
+        active_nodes = len(selector.get("outbounds", []))
+    except Exception:
+        pass
+    print(f"Сервер:             {color(host, C_CYAN)}")
+    print(f"sing-box:           {status_text(sing_active == 'active')}  автозапуск={status_text(sing_enabled == 'enabled')}")
+    print(f"xray-hermes:        {status_text(xray_active == 'active')}  автозапуск={status_text(xray_enabled == 'enabled')}")
+    print(f"VLESS-ссылки:       {unique_links} уникальных / {len(raw_links)} записей")
+    print(f"Активные узлы:      {active_nodes}")
+    print(f"Откат запуска:      {color('доступен', C_GREEN) if SESSION_BACKUP else color('снимок создастся перед первым изменением', C_DIM)}")
+    if RESULTS_FILE.exists():
+        try:
+            data = json.loads(RESULTS_FILE.read_text())
+            results = data.get("results", [])
+            both = sum(bool(x.get("chat") and x.get("gemini")) for x in results)
+            chat = sum(bool(x.get("chat")) for x in results)
+            print(f"Последний тест:      оба={color(str(both), C_GREEN)}  ChatGPT={color(str(chat), C_GREEN)}  время={data.get('tested_at', '?')}")
+        except Exception:
+            print("Последний тест:      файл результатов повреждён")
+
+
+def backup_source():
+    if not SOURCE.exists():
+        return None
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = SOURCE.with_name(f"{SOURCE.name}.bak-{stamp}")
+    shutil.copy2(SOURCE, backup)
+    return backup
+
+
+def write_source(lines):
+    require_root()
+    SOURCE.parent.mkdir(parents=True, exist_ok=True)
+    old_stat = SOURCE.stat() if SOURCE.exists() else None
+    backup = backup_source()
+    fd, name = tempfile.mkstemp(prefix=".remnawave.", dir=SOURCE.parent, text=True)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines).rstrip() + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        if old_stat:
+            os.chown(tmp, old_stat.st_uid, old_stat.st_gid)
+            os.chmod(tmp, old_stat.st_mode & 0o777)
+        else:
+            user = shutil.which("id") and run(["id", "-u", "odmin"]).stdout.strip()
+            group = shutil.which("id") and run(["id", "-g", "odmin"]).stdout.strip()
+            if user and group:
+                os.chown(tmp, int(user), int(group))
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, SOURCE)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return backup
+
+
+def list_links():
+    heading("VLESS-СЕРВЕРЫ")
+    lines = source_lines()
+    print("\nСтрока  Протокол       Сервер")
+    print("------  -------------  ----------------------------------------")
+    count = 0
+    unique = 0
+    duplicates = 0
+    seen = {}
+    for number, raw in enumerate(lines, 1):
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        count += 1
+        if text in seen:
+            duplicates += 1
+            print(f"{number:>6}  {color('ДУБЛИКАТ', C_YELLOW):<13}  повтор строки {seen[text]}")
+            continue
+        seen[text] = number
+        unique += 1
+        try:
+            proto, host, port = summarize_uri(text)
+            print(f"{number:>6}  {color(proto, C_GREEN):<13}  {host}:{port}")
+        except Exception as exc:
+            print(f"{number:>6}  {'ОШИБКА':<13}  {exc}")
+    print(f"\nНепустых записей: {count}; уникальных: {unique}; дубликатов: {duplicates}")
+
+
+def add_links():
+    print("Вставляйте VLESS-ссылки по одной на строку. Пустая строка завершает ввод.")
+    added = []
+    while True:
+        try:
+            raw = safe_input("vless> ").strip()
+        except EOFError:
+            break
+        if not raw:
+            break
+        try:
+            proto, host, port = summarize_uri(raw)
+            info(f"принято: {proto}, {host}:{port}")
+            added.append(raw)
+        except Exception as exc:
+            fail(str(exc))
+    if not added:
+        warn("ничего не добавлено")
+        return
+    lines = source_lines()
+    existing = {x.strip() for x in lines if x.strip()}
+    unique = [x for x in added if x not in existing]
+    if not unique:
+        warn("все ссылки уже присутствуют")
+        return
+    ensure_session_backup()
+    backup = write_source(lines + unique)
+    ok(f"добавлено ссылок: {len(unique)}; backup: {backup}")
+
+
+def edit_link():
+    list_links()
+    number = int(safe_input("Номер строки для изменения: ").strip())
+    lines = source_lines()
+    if number < 1 or number > len(lines):
+        raise ValueError("номер вне диапазона")
+    raw = safe_input("Новая VLESS-ссылка: ").strip()
+    proto, host, port = summarize_uri(raw)
+    print(f"Будет сохранено: {proto}, {host}:{port}")
+    if safe_input("Подтвердить изменение? [y/N]: ").strip().lower() not in {"y", "yes", "д", "да"}:
+        warn("отменено")
+        return
+    ensure_session_backup()
+    lines[number - 1] = raw
+    backup = write_source(lines)
+    ok(f"строка {number} изменена; backup: {backup}")
+
+
+def delete_links():
+    list_links()
+    raw = safe_input("Номера строк через запятую: ").strip()
+    numbers = sorted({int(x) for x in re.split(r"[ ,;]+", raw) if x}, reverse=True)
+    lines = source_lines()
+    if not numbers or any(x < 1 or x > len(lines) for x in numbers):
+        raise ValueError("некорректные номера строк")
+    print("Удаляются строки:", ", ".join(map(str, sorted(numbers))))
+    if safe_input("Подтвердить удаление? [y/N]: ").strip().lower() not in {"y", "yes", "д", "да"}:
+        warn("удаление отменено")
+        return
+    ensure_session_backup()
+    for number in numbers:
+        del lines[number - 1]
+    backup = write_source(lines)
+    ok(f"удалено ссылок: {len(numbers)}; backup: {backup}")
+
+
+def curl_status(port, url, redirects=False):
+    cmd = [
+        "curl", "--noproxy", "", "--proxy", f"socks5h://127.0.0.1:{port}",
+        "--http2", "--connect-timeout", "7", "--max-time", "20", "-sS",
+        "-o", "/dev/null", "-w", "%{http_code}",
+    ]
+    if redirects:
+        cmd += ["-L", "--max-redirs", "3"]
+    result = run(cmd + [url], timeout=25)
+    return result.stdout.strip() or f"curl:{result.returncode}"
+
+
+def service_probe(port):
+    chat_codes = [curl_status(port, CHATGPT_URL) for _ in range(2)]
+    gemini_codes = [curl_status(port, GEMINI_URL, redirects=True) for _ in range(2)]
+    chat = chat_codes == [EXPECTED_CHATGPT, EXPECTED_CHATGPT]
+    gemini = gemini_codes == [EXPECTED_GEMINI, EXPECTED_GEMINI]
+    detail = json.dumps({"chat": chat, "gemini": gemini, "chat_codes": chat_codes, "gemini_codes": gemini_codes})
+    # probe_one retries when ChatGPT is unavailable; Gemini-only nodes are not useful fallback.
+    return chat, detail
+
+
+def test_nodes(save=True):
+    heading("ПРОВЕРКА УЗЛОВ: CHATGPT + GEMINI")
+    print("Критерии: ChatGPT Codex = HTTP 404 дважды; Gemini Web = HTTP 200 дважды.\n")
+    core = load_core()
+    native, xhttp, skipped = core.parse_links()
+    raw_links = [x.strip() for x in source_lines() if x.strip() and not x.strip().startswith("#")]
+    duplicate_count = len(raw_links) - len(set(raw_links))
+    core.curl_chatgpt = service_probe
+    tasks = []
+    for index, item in enumerate(native):
+        tasks.append(("native", item, core.PROBE_PORT_BASE + index))
+    for index, item in enumerate(xhttp):
+        tasks.append(("xhttp", item, core.PROBE_PORT_BASE + len(native) + index))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max(1, len(tasks)))) as pool:
+        raw_results = list(pool.map(core.probe_one, tasks))
+    results = []
+    for kind, item, _healthy, detail in sorted(raw_results, key=lambda x: x[1]["line"]):
+        try:
+            status = json.loads(detail)
+        except json.JSONDecodeError:
+            status = {"chat": False, "gemini": False, "chat_codes": [detail], "gemini_codes": ["not-tested"]}
+        result = {
+            "line": item["line"], "id": item["id"], "kind": kind,
+            "protocol": protocol_name(item, kind), "server": item["server"],
+            **status,
+        }
+        results.append(result)
+        chat_mark = color("✓ OK", C_GREEN + C_BOLD) if result["chat"] else color("✗ " + "/".join(result["chat_codes"]), C_RED + C_BOLD)
+        gemini_mark = color("✓ OK", C_GREEN + C_BOLD) if result["gemini"] else color("✗ " + "/".join(result["gemini_codes"]), C_RED + C_BOLD)
+        print(f"строка {item['line']:>3} {result['protocol']:<13} ChatGPT={chat_mark:<9} Gemini={gemini_mark}")
+    if skipped:
+        for line, reason in skipped:
+            fail(f"строка {line}: {reason}")
+    both = [x for x in results if x["chat"] and x["gemini"]]
+    chat = [x for x in results if x["chat"]]
+    print("\n" + color("ИТОГ:", C_BOLD))
+    print(f"  Оба сервиса:   {status_text(bool(both), str(len(both)) + '/' + str(len(results)), '0/' + str(len(results)))}")
+    print(f"  ChatGPT:       {status_text(bool(chat), str(len(chat)) + '/' + str(len(results)), '0/' + str(len(results)))}")
+    print(f"  Ошибки ссылок: {status_text(not skipped, '0', str(len(skipped)))}")
+    print(f"  Дубликаты:     {color(str(duplicate_count), C_YELLOW if duplicate_count else C_GREEN)}")
+    if save:
+        ensure_session_backup()
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"tested_at": dt.datetime.now(dt.timezone.utc).isoformat(), "results": results, "skipped": skipped}
+        RESULTS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        os.chmod(RESULTS_FILE, 0o600)
+    return core, native, xhttp, results, skipped
+
+
+def select_nodes(native, xhttp, results):
+    by_id = {x["id"]: x for x in results}
+    both_ids = {x["id"] for x in results if x["chat"] and x["gemini"]}
+    chat_ids = {x["id"] for x in results if x["chat"]}
+    selected_ids = both_ids if both_ids else chat_ids
+    mode = "ChatGPT+Gemini" if both_ids else "только ChatGPT"
+    selected_native = [x for x in native if x["id"] in selected_ids]
+    selected_xhttp = [x for x in xhttp if x["id"] in selected_ids]
+    return selected_native, selected_xhttp, mode
+
+
+def apply_best(interactive=True):
+    require_root()
+    core, native, xhttp, results, skipped = test_nodes(save=True)
+    selected_native, selected_xhttp, mode = select_nodes(native, xhttp, results)
+    if not selected_native and not selected_xhttp:
+        raise RuntimeError("нет узлов с доступом к ChatGPT; активный конфиг не изменён")
+    print(f"\nРежим выбора: {mode}")
+    print(f"Будет подключено: native={len(selected_native)}, XHTTP/TLS={len(selected_xhttp)}")
+    if interactive and safe_input("Применить с резервной копией и автооткатом? [y/N]: ").strip().lower() not in {"y", "yes", "д", "да"}:
+        warn("применение отменено")
+        return
+    sing, xray = core.build_configs(selected_native, selected_xhttp)
+    with tempfile.TemporaryDirectory(prefix="vless-manager-check-") as tmp:
+        sing_path = Path(tmp) / "sing.json"
+        xray_path = Path(tmp) / "xray.json"
+        core.write_json(sing_path, sing)
+        core.write_json(xray_path, xray)
+        core.validate(sing_path, xray_path, bool(selected_xhttp))
+    ensure_session_backup()
+    core.apply_configs(sing, xray, bool(selected_xhttp))
+    verify_runtime(expected=len(selected_native) + len(selected_xhttp))
+    ok(f"применено узлов: {len(selected_native) + len(selected_xhttp)}; политика: {mode}")
+
+
+def command_exists(path):
+    return Path(path).is_file() and os.access(path, os.X_OK)
+
+
+def service_state(name):
+    active = run(["systemctl", "is-active", name]).stdout.strip()
+    enabled = run(["systemctl", "is-enabled", name]).stdout.strip()
+    return active, enabled
+
+
+def diagnostics(show_fixes=True):
+    heading("ДИАГНОСТИКА VPN")
+    issues = []
+    print(f"sing-box: {short_version(['/usr/bin/sing-box', 'version'])}")
+    print(f"Xray:     {short_version(['/usr/local/bin/xray-hermes', 'version'])}\n")
+    checks = [
+        ("sing-box", command_exists("/usr/bin/sing-box"), "установите пакет sing-box"),
+        ("Xray", command_exists("/usr/local/bin/xray-hermes"), "установите Xray в /usr/local/bin/xray-hermes"),
+        ("core-генератор", command_exists(str(CORE)), f"восстановите {CORE}"),
+        ("файл ссылок", SOURCE.is_file(), f"install -o odmin -g odmin -m 600 /dev/null {SOURCE}"),
+        ("sing-box config", SING_CONFIG.is_file(), "запустите пункт «Установить/исправить базовую конфигурацию»"),
+        ("Xray config", XRAY_CONFIG.is_file(), "запустите пункт «Установить/исправить базовую конфигурацию»"),
+        ("xray-hermes unit", XRAY_UNIT.is_file(), "запустите пункт «Установить/исправить базовую конфигурацию»"),
+    ]
+    for name, passed, fix in checks:
+        (ok if passed else fail)(name)
+        if not passed:
+            issues.append((name, fix))
+    for service in ("sing-box.service", "xray-hermes.service"):
+        active, enabled = service_state(service)
+        passed = active == "active" and enabled == "enabled"
+        (ok if passed else fail)(f"{service}: active={active}, enabled={enabled}")
+        if not passed:
+            issues.append((service, f"systemctl enable --now {service}"))
+    if command_exists("/usr/bin/sing-box") and SING_CONFIG.exists():
+        result = run(["/usr/bin/sing-box", "check", "-c", str(SING_CONFIG)])
+        (ok if result.returncode == 0 else fail)("синтаксис sing-box" + ("" if result.returncode == 0 else f": {result.stderr.strip()}"))
+        if result.returncode:
+            issues.append(("sing-box config", f"sing-box check -c {SING_CONFIG}"))
+    if command_exists("/usr/local/bin/xray-hermes") and XRAY_CONFIG.exists():
+        result = run(["/usr/local/bin/xray-hermes", "run", "-test", "-c", str(XRAY_CONFIG)])
+        (ok if result.returncode == 0 else fail)("синтаксис Xray" + ("" if result.returncode == 0 else f": {result.stderr.strip()}"))
+        if result.returncode:
+            issues.append(("Xray config", f"/usr/local/bin/xray-hermes run -test -c {XRAY_CONFIG}"))
+    codex = run(["curl", "--noproxy", "*", "--http2", "--connect-timeout", "7", "--max-time", "15", "-sS", "-o", "/dev/null", "-w", "%{http_code}", CHATGPT_URL]).stdout.strip()
+    (ok if codex == EXPECTED_CHATGPT else fail)(f"Hermes Codex API: HTTP {codex}")
+    if codex != EXPECTED_CHATGPT:
+        issues.append(("Codex API", "journalctl -u sing-box -u xray-hermes -n 100 --no-pager"))
+    gemini = run(["curl", "--noproxy", "*", "--http2", "-L", "--max-redirs", "3", "--connect-timeout", "7", "--max-time", "15", "-sS", "-o", "/dev/null", "-w", "%{http_code}", GEMINI_URL]).stdout.strip()
+    (ok if gemini == EXPECTED_GEMINI else fail)(f"Gemini Web: HTTP {gemini}")
+    if gemini != EXPECTED_GEMINI:
+        issues.append(("Gemini/DNS", "resolvectl query gemini.google.com; journalctl -u sing-box -n 100 --no-pager"))
+    if issues and show_fixes:
+        print("\nКоманды/действия для исправления:")
+        for name, fix in issues:
+            print(f"- {name}: {fix}")
+    return not issues
+
+
+def base_sing_config():
+    return {
+        "log": {"level": "info"},
+        "dns": {"servers": [{"type": "https", "tag": "bootstrap-dns", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query", "tls": {"enabled": True, "server_name": "cloudflare-dns.com"}}], "final": "bootstrap-dns"},
+        "inbounds": [{"type": "tun", "tag": "tun-in", "interface_name": "singtun0", "address": ["172.19.0.1/30"], "auto_route": True, "auto_redirect": True}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {
+            "auto_detect_interface": True,
+            "default_domain_resolver": "bootstrap-dns",
+            "rules": [{"inbound": ["tun-in"], "port": 53, "action": "hijack-dns"}],
+            "final": "direct",
+        },
+    }
+
+
+def repair_installation():
+    require_root()
+    diagnostics(show_fixes=False)
+    print("Будут созданы только отсутствующие конфиги, исправлен unit Xray и включён автозапуск.")
+    if safe_input("Продолжить? [y/N]: ").strip().lower() not in {"y", "yes", "д", "да"}:
+        warn("отменено")
+        return
+    if not command_exists("/usr/bin/sing-box") or not command_exists("/usr/local/bin/xray-hermes") or not command_exists(str(CORE)):
+        raise RuntimeError("сначала установите отсутствующие бинарники, указанные диагностикой")
+    ensure_session_backup()
+    SOURCE.parent.mkdir(parents=True, exist_ok=True)
+    if not SOURCE.exists():
+        SOURCE.touch(mode=0o600)
+        try:
+            uid = int(run(["id", "-u", "odmin"], check=True).stdout)
+            gid = int(run(["id", "-g", "odmin"], check=True).stdout)
+            os.chown(SOURCE, uid, gid)
+        except Exception:
+            pass
+    SING_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    if not SING_CONFIG.exists():
+        SING_CONFIG.write_text(json.dumps(base_sing_config(), ensure_ascii=False, indent=2) + "\n")
+        os.chmod(SING_CONFIG, 0o600)
+    XRAY_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    if not XRAY_CONFIG.exists():
+        XRAY_CONFIG.write_text(json.dumps({"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": [], "routing": {"domainStrategy": "AsIs", "rules": []}}, indent=2) + "\n")
+        os.chmod(XRAY_CONFIG, 0o600)
+    unit = """[Unit]\nDescription=Xray SOCKS for Hermes\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nDynamicUser=yes\nLoadCredential=config.json:/etc/xray-hermes/config.json\nExecStart=/usr/local/bin/xray-hermes run -c %d/config.json\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"""
+    if not XRAY_UNIT.exists() or XRAY_UNIT.read_text() != unit:
+        if XRAY_UNIT.exists():
+            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(XRAY_UNIT, XRAY_UNIT.with_name(f"{XRAY_UNIT.name}.bak-{stamp}"))
+        XRAY_UNIT.write_text(unit)
+    run(["systemctl", "daemon-reload"], check=True)
+    run(["systemctl", "enable", "sing-box.service", "xray-hermes.service"], check=True)
+    ok("базовая конфигурация и автозапуск подготовлены")
+    diagnostics()
+
+
+def create_full_backup(label):
+    """Archive VPN state and user links before destructive operations."""
+    require_root()
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(BACKUP_DIR, 0o700)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive = BACKUP_DIR / f"{label}-{stamp}.tar.gz"
+    candidates = [
+        SOURCE, SING_CONFIG.parent, XRAY_CONFIG.parent, XRAY_UNIT,
+        STATE_DIR, Path("/var/lib/sing-box"), Path("/usr/local/bin/xray-hermes"),
+        CORE,
+    ]
+    package = run(["dpkg-query", "-W", "-f=${Status}|${Version}", "sing-box"])
+    package_fields = package.stdout.strip().split("|", 1)
+    package_installed = package.returncode == 0 and package_fields[0] == "install ok installed"
+    sing_active, sing_enabled = service_state("sing-box.service")
+    xray_active, xray_enabled = service_state("xray-hermes.service")
+    metadata = {
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "label": label,
+        "paths_present": [str(path) for path in candidates if path.exists()],
+        "sing_box_package": {"installed": package_installed, "version": package_fields[1] if package_installed and len(package_fields) > 1 else None},
+        "services": {
+            "sing-box.service": {"active": sing_active == "active", "enabled": sing_enabled == "enabled"},
+            "xray-hermes.service": {"active": xray_active == "active", "enabled": xray_enabled == "enabled"},
+        },
+    }
+    with tarfile.open(archive, "w:gz") as tar:
+        for path in candidates:
+            if path.exists():
+                tar.add(path, arcname=str(path).lstrip("/"), recursive=True)
+    os.chmod(archive, 0o600)
+    metadata_path = Path(str(archive) + ".json")
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+    os.chmod(metadata_path, 0o600)
+    ok(f"создана резервная копия: {archive}")
+    return archive
+
+
+def ensure_session_backup():
+    """Create one immutable snapshot immediately before the first mutation."""
+    global SESSION_BACKUP
+    if SESSION_BACKUP is None:
+        SESSION_BACKUP = create_full_backup("session-start")
+        info("снимок состояния до изменений сохранён; доступен пункт отката")
+    return SESSION_BACKUP
+
+
+def remove_managed_paths():
+    for path in [SING_CONFIG.parent, XRAY_CONFIG.parent, STATE_DIR, Path("/var/lib/sing-box")]:
+        if path.exists():
+            shutil.rmtree(path)
+    for path in [XRAY_UNIT, Path("/usr/local/bin/xray-hermes"), SOURCE, CORE]:
+        path.unlink(missing_ok=True)
+
+
+def rollback_session():
+    """Restore files, package and service state from before this manager session."""
+    require_root()
+    heading("ОТКАТ ИЗМЕНЕНИЙ ТЕКУЩЕГО ЗАПУСКА")
+    if SESSION_BACKUP is None:
+        warn("в текущем запуске ещё не выполнялись изменения — откатывать нечего")
+        return
+    print(f"Будет восстановлен снимок: {SESSION_BACKUP}")
+    if safe_input("Откатить все изменения этого запуска? [y/N]: ").strip().lower() not in {"y", "yes", "д", "да"}:
+        warn("откат отменён")
+        return
+    safety = create_full_backup("before-session-rollback")
+    metadata_path = Path(str(SESSION_BACKUP) + ".json")
+    if not metadata_path.exists():
+        raise RuntimeError(f"отсутствуют метаданные снимка: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text())
+    try:
+        run(["systemctl", "stop", "sing-box.service", "xray-hermes.service"])
+        package = metadata["sing_box_package"]
+        current = run(["dpkg-query", "-W", "-f=${Status}|${Version}", "sing-box"])
+        current_installed = current.returncode == 0 and current.stdout.startswith("install ok installed|")
+        current_version = current.stdout.strip().split("|", 1)[1] if current_installed else None
+        if package["installed"] and current_version != package["version"]:
+            run(["apt-get", "update"], check=True, timeout=300)
+            install = run(["apt-get", "install", "-y", "--allow-downgrades", f"sing-box={package['version']}"], timeout=300)
+            if install.returncode:
+                raise RuntimeError(f"не удалось вернуть sing-box {package['version']}: {(install.stderr or install.stdout).strip()}")
+        elif not package["installed"] and current_installed:
+            run(["apt-get", "purge", "-y", "sing-box"], check=True, timeout=300)
+        remove_managed_paths()
+        restore_backup(SESSION_BACKUP, restore_service_state=False)
+        run(["systemctl", "daemon-reload"], check=True)
+        for service, state in metadata["services"].items():
+            if state["enabled"]:
+                run(["systemctl", "enable", service], check=True)
+            else:
+                run(["systemctl", "disable", service])
+            if state["active"]:
+                run(["systemctl", "restart", service], check=True)
+            else:
+                run(["systemctl", "stop", service])
+        missing = [path for path in metadata["paths_present"] if not Path(path).exists()]
+        if missing:
+            raise RuntimeError("после отката отсутствуют: " + ", ".join(missing))
+        ok("все изменения текущего запуска отменены")
+        info(f"страховочная копия состояния перед откатом: {safety}")
+    except Exception:
+        fail(f"откат не завершён; текущее состояние сохранено в {safety}")
+        raise
+
+
+def restore_backup(archive, restore_service_state=True):
+    """Restore only an archive created by create_full_backup."""
+    with tarfile.open(archive, "r:gz") as tar:
+        members = tar.getmembers()
+        if any(m.name.startswith("/") or ".." in Path(m.name).parts for m in members):
+            raise RuntimeError("небезопасные пути в backup")
+        tar.extractall("/")
+    run(["systemctl", "daemon-reload"])
+    if restore_service_state:
+        run(["systemctl", "enable", "sing-box.service", "xray-hermes.service"])
+        run(["systemctl", "restart", "xray-hermes.service", "sing-box.service"])
+
+
+def install_xray_latest():
+    arch_map = {"x86_64": "64", "amd64": "64", "aarch64": "arm64-v8a", "arm64": "arm64-v8a"}
+    machine = os.uname().machine
+    asset_arch = arch_map.get(machine)
+    if not asset_arch:
+        raise RuntimeError(f"автоустановка Xray не поддерживает архитектуру {machine}")
+    api = "https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+    request = urllib.request.Request(api, headers={"User-Agent": "vless-vpn-manager"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        release = json.load(response)
+    zip_name = f"Xray-linux-{asset_arch}.zip"
+    urls = {asset["name"]: asset["browser_download_url"] for asset in release.get("assets", [])}
+    if zip_name not in urls or zip_name + ".dgst" not in urls:
+        raise RuntimeError(f"в релизе {release.get('tag_name')} нет {zip_name} или checksum")
+    with tempfile.TemporaryDirectory(prefix="xray-install-") as tmp_name:
+        tmp = Path(tmp_name)
+        archive = tmp / zip_name
+        digest_file = tmp / (zip_name + ".dgst")
+        urllib.request.urlretrieve(urls[zip_name], archive)
+        urllib.request.urlretrieve(urls[zip_name + ".dgst"], digest_file)
+        match = re.search(r"SHA2-256=\s*([0-9a-fA-F]{64})", digest_file.read_text())
+        if not match:
+            raise RuntimeError("в checksum-файле Xray отсутствует SHA2-256")
+        import hashlib
+        actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if actual.lower() != match.group(1).lower():
+            raise RuntimeError("SHA256 архива Xray не совпадает")
+        with zipfile.ZipFile(archive) as zip_file:
+            member = next((x for x in zip_file.namelist() if Path(x).name == "xray"), None)
+            if not member:
+                raise RuntimeError("в архиве Xray отсутствует бинарник")
+            extracted = Path(zip_file.extract(member, tmp))
+        Path("/usr/local/bin").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(extracted, "/usr/local/bin/xray-hermes")
+        os.chmod("/usr/local/bin/xray-hermes", 0o755)
+    ok(f"Xray {release.get('tag_name')} установлен, SHA256 проверен")
+
+
+def write_clean_base(keep_links=True):
+    """Create deterministic configs and unit without prompting."""
+    if not keep_links or not SOURCE.exists():
+        SOURCE.parent.mkdir(parents=True, exist_ok=True)
+        SOURCE.touch(mode=0o600, exist_ok=True)
+
+    SING_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    SING_CONFIG.write_text(json.dumps(base_sing_config(), ensure_ascii=False, indent=2) + "\n")
+    os.chmod(SING_CONFIG, 0o600)
+    XRAY_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    XRAY_CONFIG.write_text(json.dumps({"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": [], "routing": {"domainStrategy": "AsIs", "rules": []}}, indent=2) + "\n")
+    os.chmod(XRAY_CONFIG, 0o600)
+    unit = """[Unit]\nDescription=Xray SOCKS for Hermes\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nDynamicUser=yes\nLoadCredential=config.json:/etc/xray-hermes/config.json\nExecStart=/usr/local/bin/xray-hermes run -c %d/config.json\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"""
+    XRAY_UNIT.parent.mkdir(parents=True, exist_ok=True)
+    XRAY_UNIT.write_text(unit)
+    run(["systemctl", "daemon-reload"], check=True)
+    run(["systemctl", "enable", "sing-box.service", "xray-hermes.service"], check=True)
+
+
+def full_cleanup():
+    """Remove VPN services/data, retaining this manager and core installer."""
+    require_root()
+    heading("ПОЛНОЕ УДАЛЕНИЕ VPN")
+    print("Будут остановлены и удалены:")
+    print("  • sing-box package и его конфигурация/state")
+    print("  • xray-hermes unit, бинарник и конфигурация")
+    print("  • VLESS-ссылки и результаты тестов")
+    print("Менеджер и core-установщик останутся для последующей чистой установки.")
+    if not confirm_phrase("VPN немедленно перестанет работать. Данные будут доступны только в backup.", "УДАЛИТЬ VPN"):
+        warn("полное удаление отменено")
+        return
+    ensure_session_backup()
+    archive = create_full_backup("before-cleanup")
+    run(["systemctl", "disable", "--now", "sing-box.service", "xray-hermes.service"])
+    apt = run(["apt-get", "purge", "-y", "sing-box"], timeout=300)
+    if apt.returncode:
+        warn("apt purge sing-box завершился с ошибкой: " + (apt.stderr or apt.stdout).strip())
+    for path in [SING_CONFIG.parent, XRAY_CONFIG.parent, STATE_DIR, Path("/var/lib/sing-box")]:
+        if path.exists():
+            shutil.rmtree(path)
+    for path in [XRAY_UNIT, Path("/usr/local/bin/xray-hermes"), SOURCE]:
+        path.unlink(missing_ok=True)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "reset-failed"])
+    remaining = [p for p in [SING_CONFIG, XRAY_CONFIG, XRAY_UNIT, Path("/usr/local/bin/xray-hermes"), SOURCE] if p.exists()]
+    if remaining:
+        raise RuntimeError("не все объекты удалены: " + ", ".join(map(str, remaining)))
+    ok("VPN-сервисы и данные полностью удалены")
+    info(f"резервная копия: {archive}")
+
+
+def clean_install():
+    """Reinstall binaries/configs and apply links using strict health policy."""
+    require_root()
+    heading("ЧИСТАЯ УСТАНОВКА VPN")
+    print("Операция остановит VPN, переустановит sing-box/Xray и пересоздаст конфиги.")
+    print("Существующие VLESS-ссылки будут сохранены и повторно проверены.")
+    if not confirm_phrase("Во время установки будет временный разрыв VPN.", "ЧИСТАЯ УСТАНОВКА"):
+        warn("чистая установка отменена")
+        return
+    ensure_session_backup()
+    archive = create_full_backup("before-clean-install")
+    try:
+        run(["systemctl", "stop", "sing-box.service", "xray-hermes.service"])
+        info("установка/обновление sing-box из настроенного APT-репозитория")
+        run(["apt-get", "update"], check=True, timeout=300)
+        run(["apt-get", "install", "-y", "--reinstall", "sing-box", "ca-certificates", "curl", "unzip"], check=True, timeout=300)
+        install_xray_latest()
+        if not CORE.exists():
+            raise RuntimeError(f"отсутствует обязательный core-установщик {CORE}")
+        if SING_CONFIG.parent.exists():
+            shutil.rmtree(SING_CONFIG.parent)
+        if XRAY_CONFIG.parent.exists():
+            shutil.rmtree(XRAY_CONFIG.parent)
+        write_clean_base(keep_links=True)
+        raw_links = [x for x in source_lines() if x.strip() and not x.strip().startswith("#")]
+        if raw_links:
+            apply_best(interactive=False)
+        else:
+            run(["systemctl", "enable", "--now", "sing-box.service", "xray-hermes.service"], check=True)
+            warn("VLESS-ссылок нет: запущена базовая конфигурация без VPN")
+        diagnostics()
+        ok("чистая установка завершена и проверена")
+    except Exception:
+        fail("чистая установка не завершена; восстанавливаю предыдущую конфигурацию")
+        try:
+            restore_backup(archive)
+            ok("предыдущая конфигурация восстановлена")
+        except Exception as restore_error:
+            fail(f"автооткат не выполнен: {restore_error}; backup: {archive}")
+        raise
+
+
+def verify_runtime(expected=None):
+    for service in ("sing-box.service", "xray-hermes.service"):
+        active = run(["systemctl", "is-active", service]).stdout.strip()
+        if active != "active":
+            raise RuntimeError(f"{service} не active: {active}")
+    status = run(["curl", "--noproxy", "*", "--http2", "--connect-timeout", "7", "--max-time", "15", "-sS", "-o", "/dev/null", "-w", "%{http_code}", CHATGPT_URL]).stdout.strip()
+    if status != EXPECTED_CHATGPT:
+        raise RuntimeError(f"Codex API после применения: HTTP {status}")
+    if expected is not None:
+        config = json.loads(SING_CONFIG.read_text())
+        selector = next((x for x in config.get("outbounds", []) if x.get("tag") == "vpn-auto"), None)
+        actual = len(selector.get("outbounds", [])) if selector else 0
+        if actual != expected:
+            raise RuntimeError(f"в vpn-auto {actual} узлов вместо {expected}")
+
+
+def show_errors():
+    print("\n=== sing-box ===")
+    print(run(["journalctl", "-u", "sing-box", "-n", "80", "--no-pager", "-p", "warning"]).stdout or "Нет warning/error")
+    print("\n=== xray-hermes ===")
+    print(run(["journalctl", "-u", "xray-hermes", "-n", "80", "--no-pager", "-p", "warning"]).stdout or "Нет warning/error")
+    print("Команды исправления после диагностики:")
+    print("  sing-box check -c /etc/sing-box/config.json")
+    print("  /usr/local/bin/xray-hermes run -test -c /etc/xray-hermes/config.json")
+    print("  systemctl restart xray-hermes sing-box")
+    print("  journalctl -u sing-box -u xray-hermes -n 100 --no-pager")
+
+
+def self_test():
+    core = load_core()
+    assert summarize_uri("vless://u@example.com:443?security=tls&type=tcp")[0] == "TLS/TCP"
+    assert summarize_uri("vless://u@example.com:443?security=tls&type=xhttp")[0] == "XHTTP/TLS"
+    try:
+        summarize_uri("https://example.com")
+        raise AssertionError("invalid URI accepted")
+    except ValueError:
+        pass
+    native, xhttp, skipped = core.parse_links()
+    sing, xray = core.build_configs(native[:1], xhttp[:1])
+    assert any(x.get("tag") == "vpn-auto" for x in sing["outbounds"])
+    assert all(o.get("streamSettings", {}).get("sockopt", {}).get("mark") == 0x2024 for o in xray["outbounds"])
+    ok("self-test пройден")
+
+
+def menu():
+    require_root()
+    while True:
+        clear_screen()
+        dashboard()
+        print(color("\n  ДИАГНОСТИКА", C_CYAN + C_BOLD))
+        print("   1. Полная диагностика установки и подключения")
+        print("   2. Показать ошибки сервисов и команды исправления")
+        print(color("\n  VLESS-СЕРВЕРЫ", C_CYAN + C_BOLD))
+        print("   3. Показать ссылки (UUID скрыты)")
+        print("   4. Добавить ссылки")
+        print("   5. Редактировать ссылку")
+        print("   6. Удалить ссылки")
+        print("   7. Проверить все узлы: ChatGPT + Gemini")
+        print("   8. Автовыбор и применение лучших узлов")
+        print(color("\n  УСТАНОВКА И ОБСЛУЖИВАНИЕ", C_MAGENTA + C_BOLD))
+        print("   9. Исправить базовую конфигурацию и автозапуск")
+        print("  10. Чистая переустановка VPN")
+        print(color("  11. ПОЛНОСТЬЮ УДАЛИТЬ VPN", C_RED + C_BOLD))
+        print(color("  12. Откатить все изменения текущего запуска", C_YELLOW + C_BOLD))
+        print("\n   0. Выход\n")
+        choice = safe_input("Выбор: ").strip()
+        try:
+            if choice == "1": diagnostics()
+            elif choice == "2": show_errors()
+            elif choice == "3": list_links()
+            elif choice == "4": add_links()
+            elif choice == "5": edit_link()
+            elif choice == "6": delete_links()
+            elif choice == "7": test_nodes()
+            elif choice == "8": apply_best(interactive=True)
+            elif choice == "9": repair_installation()
+            elif choice == "10": clean_install()
+            elif choice == "11": full_cleanup()
+            elif choice == "12": rollback_session()
+            elif choice == "0": return
+            else: warn("неизвестный пункт")
+        except Exception as exc:
+            fail(str(exc))
+        pause_before_menu()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Интерактивная настройка VLESS VPN")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--diagnose", action="store_true")
+    group.add_argument("--test", action="store_true")
+    group.add_argument("--apply", action="store_true")
+    group.add_argument("--repair", action="store_true")
+    group.add_argument("--clean-install", action="store_true")
+    group.add_argument("--cleanup", action="store_true")
+    group.add_argument("--list", action="store_true")
+    group.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("менеджер уже запущен в другом терминале; завершите тот сеанс и повторите") from exc
+        if args.diagnose: diagnostics()
+        elif args.test: test_nodes()
+        elif args.apply: apply_best(interactive=False)
+        elif args.repair: repair_installation()
+        elif args.clean_install: clean_install()
+        elif args.cleanup: full_cleanup()
+        elif args.list: list_links()
+        elif args.self_test: self_test()
+        else: menu()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nОтменено")
+        raise SystemExit(130)
+    except Exception as exc:
+        fail(str(exc))
+        raise SystemExit(1)

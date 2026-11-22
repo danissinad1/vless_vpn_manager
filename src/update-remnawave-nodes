@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+import argparse
+import concurrent.futures
+import copy
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+SOURCE = Path(os.environ.get("VLESS_LINKS_FILE", "/etc/vless-vpn-manager/links.txt"))
+SING_CONFIG = Path(os.environ.get("VLESS_SING_CONFIG", "/etc/sing-box/config.json"))
+XRAY_CONFIG = Path(os.environ.get("VLESS_XRAY_CONFIG", "/etc/xray-hermes/config.json"))
+SING_BIN = "/usr/bin/sing-box"
+XRAY_BIN = "/usr/local/bin/xray-hermes"
+LOCK = Path(os.environ.get("VLESS_CORE_LOCK_FILE", "/run/lock/update-remnawave-nodes.lock"))
+SOCKS_PORT_BASE = 19081
+PROBE_PORT_BASE = 21000
+CHATGPT_PROBE_URL = "https://chatgpt.com/cdn-cgi/trace"
+HERMES_CODEX_URL = "https://chatgpt.com/backend-api/codex"
+BYPASS_MARK = 0x2024
+
+
+def one(query, key, default=""):
+    return unquote(query.get(key, [default])[0])
+
+
+def as_bool(value):
+    return str(value).lower() in {"1", "true", "yes"}
+
+
+def run(command):
+    result = subprocess.run(command, text=True, capture_output=True)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"команда завершилась с кодом {result.returncode}: {' '.join(command)}\n{detail}")
+    return result
+
+
+def parse_links():
+    native = []
+    xhttp = []
+    skipped = []
+    seen = set()
+    for line_no, raw in enumerate(SOURCE.read_text().splitlines(), 1):
+        raw = raw.strip()
+        if not raw or raw.startswith("#") or raw in seen:
+            continue
+        seen.add(raw)
+        try:
+            uri = urlparse(raw)
+            q = parse_qs(uri.query)
+            security = one(q, "security").lower()
+            transport = one(q, "type", "tcp").lower()
+            if transport == "raw":
+                transport = "tcp"
+            if uri.scheme.lower() != "vless" or not uri.hostname or not uri.port or not uri.username:
+                raise ValueError("неполная VLESS-ссылка")
+            item = {
+                "line": line_no,
+                "id": hashlib.sha256(raw.encode()).hexdigest()[:12],
+                "server": uri.hostname,
+                "port": uri.port,
+                "uuid": unquote(uri.username),
+                "security": security,
+                "transport": transport,
+                "flow": one(q, "flow"),
+                "sni": one(q, "sni", uri.hostname),
+                "fp": one(q, "fp"),
+                "insecure": as_bool(one(q, "allowInsecure", one(q, "insecure", "0"))),
+                "alpn": [x for x in one(q, "alpn").split(",") if x],
+                "path": one(q, "path", "/"),
+                "host": one(q, "host"),
+                "mode": one(q, "mode", "auto"),
+                "extra": one(q, "extra"),
+                "pbk": one(q, "pbk"),
+                "sid": one(q, "sid"),
+            }
+            if transport == "tcp" and security in {"reality", "tls"}:
+                if security == "reality" and not item["pbk"]:
+                    raise ValueError("Reality без pbk")
+                native.append(item)
+            elif transport == "xhttp" and security == "tls":
+                xhttp.append(item)
+            else:
+                raise ValueError(f"неподдерживаемая комбинация {security}/{transport}")
+        except Exception as exc:
+            skipped.append((line_no, str(exc)))
+    if not native and not xhttp:
+        raise RuntimeError("не найдено ни одной поддерживаемой ссылки")
+    return native, xhttp, skipped
+
+
+def sing_fingerprint(value):
+    """Normalize Remnawave/Xray fingerprint aliases for sing-box uTLS."""
+    value = value.lower()
+    if value.startswith("hello"):
+        value = value[5:]
+    value = value.split("_", 1)[0]
+    aliases = {"chromium": "chrome", "safariios": "ios"}
+    return aliases.get(value, value)
+
+
+def native_outbound(item, tag):
+    tls = {
+        "enabled": True,
+        "server_name": item["sni"],
+        "insecure": item["insecure"],
+    }
+    if item["fp"]:
+        tls["utls"] = {"enabled": True, "fingerprint": sing_fingerprint(item["fp"])}
+    if item["alpn"]:
+        tls["alpn"] = item["alpn"]
+    if item["security"] == "reality":
+        tls["reality"] = {
+            "enabled": True,
+            "public_key": item["pbk"],
+            "short_id": item["sid"],
+        }
+    outbound = {
+        "type": "vless",
+        "tag": tag,
+        "server": item["server"],
+        "server_port": item["port"],
+        "uuid": item["uuid"],
+        "tls": tls,
+    }
+    if item["flow"]:
+        outbound["flow"] = item["flow"]
+    return outbound
+
+
+def default_interface():
+    result = run(["ip", "-j", "route", "get", "1.1.1.1"])
+    routes = json.loads(result.stdout)
+    if not routes or not routes[0].get("dev"):
+        raise RuntimeError("не удалось определить физический интерфейс")
+    return routes[0]["dev"]
+
+
+def xray_pair(item, index, port=None):
+    stable_id = item["id"]
+    in_tag = f"socks-xhttp-{stable_id}"
+    out_tag = f"vless-xhttp-{stable_id}"
+    port = port or (SOCKS_PORT_BASE + index - 1)
+    tls = {
+        "serverName": item["sni"],
+        "allowInsecure": item["insecure"],
+    }
+    if item["fp"]:
+        tls["fingerprint"] = item["fp"]
+    if item["alpn"]:
+        tls["alpn"] = item["alpn"]
+    xsettings = {"path": item["path"], "mode": item["mode"]}
+    if item["host"]:
+        xsettings["host"] = item["host"]
+    if item["extra"]:
+        try:
+            xsettings["extra"] = json.loads(item["extra"])
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"строка {item['line']}: некорректный JSON в extra: {exc}") from exc
+    inbound = {
+        "tag": in_tag,
+        "listen": "127.0.0.1",
+        "port": port,
+        "protocol": "socks",
+        "settings": {"udp": True},
+    }
+    outbound = {
+        "tag": out_tag,
+        "protocol": "vless",
+        "settings": {
+            "address": item["server"],
+            "port": item["port"],
+            "id": item["uuid"],
+            "encryption": "none",
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "tls",
+            "xhttpSettings": xsettings,
+            "tlsSettings": tls,
+            "sockopt": {"mark": BYPASS_MARK, "interface": default_interface()},
+        },
+    }
+    rule = {"type": "field", "inboundTag": [in_tag], "outboundTag": out_tag}
+    helper = {"type": "socks", "tag": f"xhttp-{stable_id}", "server": "127.0.0.1", "server_port": port}
+    return inbound, outbound, rule, helper
+
+
+def build_configs(native, xhttp):
+    sing = json.loads(SING_CONFIG.read_text())
+    preserved = []
+    for outbound in sing.get("outbounds", []):
+        tag = outbound.get("tag", "")
+        if tag == "vpn-auto" or tag == "xray-auto" or tag.startswith("node-") or tag.startswith("xray-") or tag.startswith("xhttp-"):
+            continue
+        preserved.append(outbound)
+
+    managed = []
+    selectable = []
+    for item in native:
+        tag = f"node-{item['id']}"
+        managed.append(native_outbound(item, tag))
+        selectable.append(tag)
+
+    xray_inbounds = []
+    xray_outbounds = []
+    xray_rules = []
+    for index, item in enumerate(xhttp, 1):
+        inbound, outbound, rule, helper = xray_pair(item, index)
+        xray_inbounds.append(inbound)
+        xray_outbounds.append(outbound)
+        xray_rules.append(rule)
+        managed.append(helper)
+        selectable.append(helper["tag"])
+
+    if not selectable:
+        raise RuntimeError("пустой список узлов vpn-auto")
+    selector = {
+        "type": "urltest",
+        "tag": "vpn-auto",
+        "outbounds": selectable,
+        "url": CHATGPT_PROBE_URL,
+        "interval": "5m",
+        "tolerance": 100,
+    }
+    sing["outbounds"] = managed + [selector] + preserved
+
+    old_xray = json.loads(XRAY_CONFIG.read_text()) if XRAY_CONFIG.exists() else {}
+    xray = {
+        "log": old_xray.get("log", {"loglevel": "warning"}),
+        "inbounds": xray_inbounds,
+        "outbounds": xray_outbounds,
+        "routing": {"domainStrategy": "AsIs", "rules": xray_rules},
+    }
+    return sing, xray
+
+
+def write_json(path, value, mode=0o600):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    os.chmod(path, mode)
+
+
+def validate(sing_path, xray_path, have_xhttp):
+    run([SING_BIN, "check", "-c", str(sing_path)])
+    if have_xhttp:
+        run([XRAY_BIN, "run", "-test", "-c", str(xray_path)])
+
+
+def wait_listener(port, process, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def curl_chatgpt(port):
+    statuses = []
+    for _ in range(2):
+        result = subprocess.run(
+            [
+                "curl", "--noproxy", "", "--proxy", f"socks5h://127.0.0.1:{port}",
+                "--http2", "--connect-timeout", "7", "--max-time", "15", "-sS", "-o", "/dev/null",
+                "-w", "%{http_code}", HERMES_CODEX_URL,
+            ],
+            text=True,
+            capture_output=True,
+        )
+        statuses.append(result.stdout.strip() or f"curl:{result.returncode}")
+    healthy = statuses == ["404", "404"]
+    return healthy, f"codex={','.join(statuses)}"
+
+
+def probe_one(task):
+    kind, item, port = task
+    with tempfile.TemporaryDirectory(prefix="remnawave-probe-") as tmp:
+        config_path = Path(tmp) / f"{kind}.json"
+        if kind == "native":
+            outbound = native_outbound(item, "probe")
+            outbound["bind_interface"] = default_interface()
+            outbound["routing_mark"] = BYPASS_MARK
+            config = {
+                "log": {"level": "error"},
+                "inbounds": [{"type": "socks", "tag": "probe-in", "listen": "127.0.0.1", "listen_port": port}],
+                "outbounds": [outbound],
+                "route": {"final": "probe"},
+            }
+            write_json(config_path, config)
+            command = [SING_BIN, "run", "-c", str(config_path)]
+            check = [SING_BIN, "check", "-c", str(config_path)]
+        else:
+            inbound, outbound, rule, _ = xray_pair(item, 1, port=port)
+            config = {
+                "log": {"loglevel": "error"},
+                "inbounds": [inbound],
+                "outbounds": [outbound],
+                "routing": {"domainStrategy": "AsIs", "rules": [rule]},
+            }
+            write_json(config_path, config)
+            command = [XRAY_BIN, "run", "-c", str(config_path)]
+            check = [XRAY_BIN, "run", "-test", "-c", str(config_path)]
+        process = None
+        try:
+            run(check)
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not wait_listener(port, process):
+                return kind, item, False, "listener"
+            healthy, detail = False, "not tested"
+            for attempt in range(3):
+                healthy, detail = curl_chatgpt(port)
+                if healthy:
+                    break
+                if attempt < 2:
+                    time.sleep(2)
+            return kind, item, healthy, detail
+        except Exception as exc:
+            return kind, item, False, str(exc).splitlines()[-1]
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+def probe_links(native, xhttp):
+    tasks = []
+    for index, item in enumerate(native):
+        tasks.append(("native", item, PROBE_PORT_BASE + index))
+    for index, item in enumerate(xhttp):
+        tasks.append(("xhttp", item, PROBE_PORT_BASE + len(native) + index))
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, max(1, len(tasks)))) as pool:
+        for result in pool.map(probe_one, tasks):
+            results.append(result)
+    healthy_native = []
+    healthy_xhttp = []
+    for kind, item, healthy, detail in sorted(results, key=lambda x: x[1]["line"]):
+        protocol = "XHTTP/TLS" if kind == "xhttp" else ("Reality/TCP" if item["security"] == "reality" else "TLS/TCP")
+        status = "OK" if healthy else f"FAIL ({detail})"
+        print(f"Проверка ChatGPT: строка {item['line']} {protocol}: {status}")
+        if healthy:
+            (healthy_xhttp if kind == "xhttp" else healthy_native).append(item)
+    return healthy_native, healthy_xhttp
+
+
+def apply_configs(sing, xray, have_xhttp):
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    rollback_unit = f"remnawave-rollback-{stamp}"
+    sing_backup = SING_CONFIG.with_name(f"config.json.bak-{stamp}")
+    xray_backup = XRAY_CONFIG.with_name(f"config.json.bak-{stamp}")
+    xray_was_active = subprocess.run(["systemctl", "is-active", "--quiet", "xray-hermes.service"]).returncode == 0
+    shutil.copy2(SING_CONFIG, sing_backup)
+    if XRAY_CONFIG.exists():
+        shutil.copy2(XRAY_CONFIG, xray_backup)
+
+    rollback_parts = [
+        f"cp -a {sing_backup} {SING_CONFIG}",
+        f"cp -a {xray_backup} {XRAY_CONFIG}" if xray_backup.exists() else ":",
+        "systemctl restart sing-box.service",
+        "systemctl restart xray-hermes.service" if xray_was_active else "systemctl stop xray-hermes.service",
+    ]
+    run([
+        "systemd-run", f"--unit={rollback_unit}", "--on-active=90s",
+        "/bin/sh", "-c", "; ".join(rollback_parts),
+    ])
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", dir=SING_CONFIG.parent, delete=False) as fh:
+        sing_tmp = Path(fh.name)
+    with tempfile.NamedTemporaryFile("w", suffix=".json", dir=XRAY_CONFIG.parent, delete=False) as fh:
+        xray_tmp = Path(fh.name)
+    try:
+        write_json(sing_tmp, sing)
+        write_json(xray_tmp, xray)
+        validate(sing_tmp, xray_tmp, have_xhttp)
+        os.replace(xray_tmp, XRAY_CONFIG)
+        os.replace(sing_tmp, SING_CONFIG)
+        if have_xhttp:
+            run(["systemctl", "restart", "xray-hermes.service"])
+        else:
+            run(["systemctl", "stop", "xray-hermes.service"])
+        run(["systemctl", "restart", "sing-box.service"])
+        run(["systemctl", "is-active", "sing-box.service"])
+        if have_xhttp:
+            run(["systemctl", "is-active", "xray-hermes.service"])
+        online = False
+        for _ in range(10):
+            check = subprocess.run(
+                ["curl", "--noproxy", "*", "--http2", "--connect-timeout", "5", "--max-time", "10", "-sS", "-o", "/dev/null", "-w", "%{http_code}", HERMES_CODEX_URL],
+                text=True,
+                capture_output=True,
+            )
+            if check.returncode == 0 and check.stdout.strip() == "404":
+                online = True
+                break
+            time.sleep(3)
+        if not online:
+            raise RuntimeError("после применения отсутствует доступ к ChatGPT")
+        subprocess.run(["systemctl", "stop", f"{rollback_unit}.timer"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "reset-failed", f"{rollback_unit}.timer", f"{rollback_unit}.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        shutil.copy2(sing_backup, SING_CONFIG)
+        if xray_backup.exists():
+            shutil.copy2(xray_backup, XRAY_CONFIG)
+        if xray_was_active:
+            subprocess.run(["systemctl", "restart", "xray-hermes.service"])
+        else:
+            subprocess.run(["systemctl", "stop", "xray-hermes.service"])
+        subprocess.run(["systemctl", "restart", "sing-box.service"])
+        subprocess.run(["systemctl", "stop", f"{rollback_unit}.timer"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        raise
+    finally:
+        sing_tmp.unlink(missing_ok=True)
+        xray_tmp.unlink(missing_ok=True)
+    print(f"Резервные копии: {sing_backup}, {xray_backup}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check-only", action="store_true", help="собрать и проверить кандидаты без применения")
+    parser.add_argument("--probe", action="store_true", help="изолированно проверить доступ к ChatGPT через каждую ссылку")
+    parser.add_argument("--apply", action="store_true", help="применить конфигурацию и перезапустить сервисы")
+    args = parser.parse_args()
+    if sum((args.check_only, args.probe, args.apply)) != 1:
+        parser.error("укажите ровно один режим: --check-only, --probe или --apply")
+
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        native, xhttp, skipped = parse_links()
+        selected_native, selected_xhttp = native, xhttp
+        if args.probe or args.apply:
+            selected_native, selected_xhttp = probe_links(native, xhttp)
+            print(
+                f"Доступны для ChatGPT: native={len(selected_native)}/{len(native)}, "
+                f"XHTTP/TLS={len(selected_xhttp)}/{len(xhttp)}"
+            )
+            if args.probe:
+                return
+            if not selected_native and not selected_xhttp:
+                raise RuntimeError("ни одна ссылка не прошла проверку ChatGPT; активный конфиг не изменён")
+        sing, xray = build_configs(selected_native, selected_xhttp)
+        with tempfile.TemporaryDirectory(prefix="remnawave-check-") as tmp:
+            sing_tmp = Path(tmp) / "sing-box.json"
+            xray_tmp = Path(tmp) / "xray.json"
+            write_json(sing_tmp, sing)
+            write_json(xray_tmp, xray)
+            validate(sing_tmp, xray_tmp, bool(selected_xhttp))
+        reality = sum(x["security"] == "reality" for x in selected_native)
+        tls_tcp = sum(x["security"] == "tls" for x in selected_native)
+        print(f"Проверка успешна: Reality/TCP={reality}, TLS/TCP={tls_tcp}, TLS/XHTTP={len(selected_xhttp)}, пропущено={len(skipped)}")
+        for line, reason in skipped:
+            print(f"Пропущена строка {line}: {reason}", file=sys.stderr)
+        if args.apply:
+            apply_configs(sing, xray, bool(selected_xhttp))
+
+
+if __name__ == "__main__":
+    main()

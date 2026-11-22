@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import importlib.machinery
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER = importlib.machinery.SourceFileLoader(
     "vless_manager_dependencies", str(ROOT / "src/vless-vpn-manager")
+).load_module()
+CORE = importlib.machinery.SourceFileLoader(
+    "vless_manager_core", str(ROOT / "src/update-remnawave-nodes")
 ).load_module()
 
 
@@ -187,6 +191,43 @@ class ConnectivityTests(unittest.TestCase):
 
         results = MANAGER.check_service_connectivity(run_command=fake_run, display=False)
         self.assertEqual([item["state"] for item in results], ["available", "restricted", "failed"])
+
+
+class RoutingTests(unittest.TestCase):
+    def test_applied_config_routes_tun_traffic_through_vpn_auto(self):
+        native = [{
+            "id": "test-node",
+            "server": "vpn.example.com",
+            "port": 443,
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "security": "tls",
+            "flow": "",
+            "sni": "vpn.example.com",
+            "fp": "",
+            "insecure": False,
+            "alpn": [],
+            "pbk": "",
+            "sid": "",
+        }]
+        base = {
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {
+                "rules": [{"inbound": ["tun-in"], "port": 53, "action": "hijack-dns"}],
+                "final": "direct",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = CORE.SING_CONFIG
+            CORE.SING_CONFIG = Path(tmp) / "sing-box.json"
+            CORE.SING_CONFIG.write_text(json.dumps(base))
+            try:
+                sing, _ = CORE.build_configs(native, [])
+            finally:
+                CORE.SING_CONFIG = original
+
+        self.assertEqual(sing["route"]["final"], "vpn-auto")
+        self.assertEqual(sing["route"]["rules"], base["route"]["rules"])
 
 
 if __name__ == "__main__":

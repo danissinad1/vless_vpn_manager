@@ -2,9 +2,12 @@
 import base64
 import hashlib
 import importlib.machinery
+import io
 import json
 import tempfile
 import unittest
+import uuid
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +25,40 @@ class FakeResult:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+class InputTests(unittest.TestCase):
+    def test_reads_from_controlling_terminal_when_script_arrives_on_stdin(self):
+        piped_stdin = io.TextIOWrapper(io.BytesIO(b""), encoding="utf-8")
+        terminal = io.BytesIO(b"13\n")
+
+        with patch.object(MANAGER.sys, "stdin", piped_stdin), patch(
+            "builtins.open", return_value=terminal
+        ) as open_terminal:
+            self.assertEqual(MANAGER.safe_input("Выбор: "), "13")
+
+        open_terminal.assert_called_once_with("/dev/tty", "rb", buffering=0)
+
+
+class DashboardTests(unittest.TestCase):
+    def test_service_status_values_start_in_same_column(self):
+        output = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            MANAGER, "SING_CONFIG", Path(tmp) / "missing-sing-box.json"
+        ), patch.object(
+            MANAGER, "RESULTS_FILE", Path(tmp) / "missing-results.json"
+        ), patch.object(
+            MANAGER, "source_lines", return_value=[]
+        ), patch.object(
+            MANAGER, "service_state", return_value=("inactive", "disabled")
+        ), redirect_stdout(output):
+            MANAGER.dashboard()
+
+        lines = output.getvalue().splitlines()
+        sing_box = next(line for line in lines if line.startswith("sing-box:"))
+        xray = next(line for line in lines if line.startswith("xray:"))
+        self.assertEqual(sing_box.index("●"), xray.index("●"))
 
 
 class DependencyPreflightTests(unittest.TestCase):
@@ -192,7 +229,7 @@ class SubscriptionTests(unittest.TestCase):
 
         self.assertEqual(MANAGER.extract_subscription_links(payload), links)
 
-    def test_fetch_sends_stable_hwid_for_device_limited_subscriptions(self):
+    def test_fetch_derives_stable_hwid_from_computer_name(self):
         link = "vless://first@example.com:443?security=tls&type=tcp#one"
         payload = base64.urlsafe_b64encode((link + "\n").encode())
         requests = []
@@ -219,14 +256,16 @@ class SubscriptionTests(unittest.TestCase):
             state_dir = Path(tmp) / "state"
             with patch.object(MANAGER, "STATE_DIR", state_dir), patch.object(
                 MANAGER.urllib.request, "urlopen", fake_urlopen
+            ), patch.object(
+                MANAGER.socket, "gethostname", return_value="sectortest"
             ):
                 self.assertEqual(MANAGER.fetch_subscription("https://example.com/subscription-token"), [link])
                 self.assertEqual(MANAGER.fetch_subscription("https://example.com/subscription-token"), [link])
 
             hwids = [request.get_header("X-hwid") for request in requests]
-            self.assertRegex(hwids[0], r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
-            self.assertEqual(hwids, [hwids[0], hwids[0]])
-            self.assertEqual((state_dir / "subscription-hwid").stat().st_mode & 0o777, 0o600)
+            expected = str(uuid.uuid5(uuid.NAMESPACE_DNS, "sectortest"))
+            self.assertEqual(hwids, [expected, expected])
+            self.assertFalse((state_dir / "subscription-hwid").exists())
 
     def test_skips_incompatible_vless_links_in_mixed_subscription(self):
         unsupported = "vless://plain@example.org:80?security=none&type=tcp#plain"

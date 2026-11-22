@@ -26,8 +26,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 CORE = Path(os.environ.get("VLESS_MANAGER_CORE", "/usr/local/sbin/update-remnawave-nodes"))
 SOURCE = Path(os.environ.get("VLESS_LINKS_FILE", "/etc/vless-vpn-manager/links.txt"))
 SING_CONFIG = Path(os.environ.get("VLESS_SING_CONFIG", "/etc/sing-box/config.json"))
-XRAY_CONFIG = Path(os.environ.get("VLESS_XRAY_CONFIG", "/etc/xray-hermes/config.json"))
-XRAY_UNIT = Path(os.environ.get("VLESS_XRAY_UNIT", "/etc/systemd/system/xray-hermes.service"))
+XRAY_CONFIG = Path(os.environ.get("VLESS_XRAY_CONFIG", "/etc/xray/config.json"))
+XRAY_UNIT = Path(os.environ.get("VLESS_XRAY_UNIT", "/etc/systemd/system/xray.service"))
+XRAY_BIN = Path(os.environ.get("VLESS_XRAY_BIN", "/usr/local/bin/xray"))
+LEGACY_XRAY_CONFIG_DIR = Path("/etc/xray-hermes")
+LEGACY_XRAY_UNIT = Path("/etc/systemd/system/xray-hermes.service")
+LEGACY_XRAY_BIN = Path("/usr/local/bin/xray-hermes")
 STATE_DIR = Path(os.environ.get("VLESS_STATE_DIR", "/var/lib/vless-vpn-manager"))
 BACKUP_DIR = Path(os.environ.get("VLESS_BACKUP_DIR", "/root/vless-vpn-backups"))
 RESULTS_FILE = STATE_DIR / "last-results.json"
@@ -176,7 +180,7 @@ def dashboard():
     heading("VLESS VPN MANAGER")
     host = socket.gethostname()
     sing_active, sing_enabled = service_state("sing-box.service")
-    xray_active, xray_enabled = service_state("xray-hermes.service")
+    xray_active, xray_enabled = service_state("xray.service")
     raw_links = [x.strip() for x in source_lines() if x.strip() and not x.strip().startswith("#")]
     unique_links = len(set(raw_links))
     active_nodes = 0
@@ -188,7 +192,7 @@ def dashboard():
         pass
     print(f"Сервер:             {color(host, C_CYAN)}")
     print(f"sing-box:           {status_text(sing_active == 'active')}  автозапуск={status_text(sing_enabled == 'enabled')}")
-    print(f"xray-hermes:        {status_text(xray_active == 'active')}  автозапуск={status_text(xray_enabled == 'enabled')}")
+    print(f"xray:        {status_text(xray_active == 'active')}  автозапуск={status_text(xray_enabled == 'enabled')}")
     print(f"VLESS-ссылки:       {unique_links} уникальных / {len(raw_links)} записей")
     print(f"Активные узлы:      {active_nodes}")
     print(f"Откат запуска:      {color('доступен', C_GREEN) if SESSION_BACKUP else color('снимок создастся перед первым изменением', C_DIM)}")
@@ -559,25 +563,111 @@ def service_state(name):
     return active, enabled
 
 
+def control_service(service, action, run_command=None, state_reader=None, backup=None):
+    allowed_services = {"sing-box.service", "xray.service"}
+    allowed_actions = {"start", "stop", "restart", "enable", "disable"}
+    if service not in allowed_services:
+        raise ValueError(f"неподдерживаемая служба: {service}")
+    if action not in allowed_actions:
+        raise ValueError(f"неподдерживаемое действие: {action}")
+    runner = run_command or run
+    reader = state_reader or service_state
+    create_backup = backup or ensure_session_backup
+    create_backup()
+    runner(["systemctl", action, service], check=True)
+    active, enabled = reader(service)
+    if action in {"start", "restart"} and active != "active":
+        raise RuntimeError(f"{service} не запущена после команды: {active or 'unknown'}")
+    if action == "stop" and active == "active":
+        raise RuntimeError(f"{service} осталась запущенной")
+    if action == "enable" and enabled != "enabled":
+        raise RuntimeError(f"автозапуск {service} не включён: {enabled or 'unknown'}")
+    if action == "disable" and enabled == "enabled":
+        raise RuntimeError(f"автозапуск {service} остался включён")
+    return active, enabled
+
+
+def service_action_menu(service, label):
+    actions = {
+        "1": ("start", "служба запущена"),
+        "2": ("stop", "служба остановлена"),
+        "3": ("restart", "служба перезапущена"),
+        "4": ("enable", "автозапуск включён"),
+        "5": ("disable", "автозапуск отключён"),
+    }
+    while True:
+        clear_screen()
+        heading(f"УПРАВЛЕНИЕ {label.upper()}")
+        active, enabled = service_state(service)
+        print(f"Состояние:   {status_text(active == 'active', 'РАБОТАЕТ', 'ОСТАНОВЛЕНА')}")
+        print(f"Автозапуск: {status_text(enabled == 'enabled', 'ВКЛЮЧЁН', 'ОТКЛЮЧЁН')}")
+        print("\n   1. Запустить")
+        print("   2. Остановить")
+        print("   3. Перезапустить")
+        print("   4. Включить автозапуск")
+        print("   5. Отключить автозапуск")
+        print("\n   0. Назад\n")
+        choice = safe_input("Выбор: ").strip()
+        if choice == "0":
+            return
+        if choice not in actions:
+            warn("неизвестный пункт")
+            continue
+        action, message = actions[choice]
+        try:
+            control_service(service, action)
+            ok(message)
+        except Exception as exc:
+            fail(str(exc))
+        try:
+            safe_input(color("\nНажмите Enter, чтобы продолжить…", C_DIM))
+        except EOFError:
+            return
+
+
+def service_management_menu():
+    while True:
+        clear_screen()
+        heading("УПРАВЛЕНИЕ СЛУЖБАМИ")
+        for label, service in (("sing-box", "sing-box.service"), ("xray", "xray.service")):
+            active, enabled = service_state(service)
+            print(
+                f"{label:<10} {status_text(active == 'active', 'РАБОТАЕТ', 'ОСТАНОВЛЕНА')}  "
+                f"автозапуск={status_text(enabled == 'enabled', 'ВКЛ', 'ВЫКЛ')}"
+            )
+        print("\n   1. Управление sing-box")
+        print("   2. Управление xray")
+        print("\n   0. Назад\n")
+        choice = safe_input("Выбор: ").strip()
+        if choice == "1":
+            service_action_menu("sing-box.service", "sing-box")
+        elif choice == "2":
+            service_action_menu("xray.service", "xray")
+        elif choice == "0":
+            return
+        else:
+            warn("неизвестный пункт")
+
+
 def diagnostics(show_fixes=True):
     heading("ДИАГНОСТИКА VPN")
     issues = []
     print(f"sing-box: {short_version(['/usr/bin/sing-box', 'version'])}")
-    print(f"Xray:     {short_version(['/usr/local/bin/xray-hermes', 'version'])}\n")
+    print(f"Xray:     {short_version([str(XRAY_BIN), 'version'])}\n")
     checks = [
         ("sing-box", command_exists("/usr/bin/sing-box"), "установите пакет sing-box"),
-        ("Xray", command_exists("/usr/local/bin/xray-hermes"), "установите Xray в /usr/local/bin/xray-hermes"),
+        ("Xray", command_exists(str(XRAY_BIN)), f"установите Xray в {XRAY_BIN}"),
         ("core-генератор", command_exists(str(CORE)), f"восстановите {CORE}"),
         ("файл ссылок", SOURCE.is_file(), f"install -o odmin -g odmin -m 600 /dev/null {SOURCE}"),
         ("sing-box config", SING_CONFIG.is_file(), "запустите пункт «Установить/исправить базовую конфигурацию»"),
         ("Xray config", XRAY_CONFIG.is_file(), "запустите пункт «Установить/исправить базовую конфигурацию»"),
-        ("xray-hermes unit", XRAY_UNIT.is_file(), "запустите пункт «Установить/исправить базовую конфигурацию»"),
+        ("xray unit", XRAY_UNIT.is_file(), "запустите пункт «Установить/исправить базовую конфигурацию»"),
     ]
     for name, passed, fix in checks:
         (ok if passed else fail)(name)
         if not passed:
             issues.append((name, fix))
-    for service in ("sing-box.service", "xray-hermes.service"):
+    for service in ("sing-box.service", "xray.service"):
         active, enabled = service_state(service)
         passed = active == "active" and enabled == "enabled"
         (ok if passed else fail)(f"{service}: active={active}, enabled={enabled}")
@@ -588,15 +678,15 @@ def diagnostics(show_fixes=True):
         (ok if result.returncode == 0 else fail)("синтаксис sing-box" + ("" if result.returncode == 0 else f": {result.stderr.strip()}"))
         if result.returncode:
             issues.append(("sing-box config", f"sing-box check -c {SING_CONFIG}"))
-    if command_exists("/usr/local/bin/xray-hermes") and XRAY_CONFIG.exists():
-        result = run(["/usr/local/bin/xray-hermes", "run", "-test", "-c", str(XRAY_CONFIG)])
+    if command_exists(str(XRAY_BIN)) and XRAY_CONFIG.exists():
+        result = run([str(XRAY_BIN), "run", "-test", "-c", str(XRAY_CONFIG)])
         (ok if result.returncode == 0 else fail)("синтаксис Xray" + ("" if result.returncode == 0 else f": {result.stderr.strip()}"))
         if result.returncode:
-            issues.append(("Xray config", f"/usr/local/bin/xray-hermes run -test -c {XRAY_CONFIG}"))
+            issues.append(("Xray config", f"{XRAY_BIN} run -test -c {XRAY_CONFIG}"))
     codex = run(["curl", "--noproxy", "*", "--http2", "--connect-timeout", "7", "--max-time", "15", "-sS", "-o", "/dev/null", "-w", "%{http_code}", CHATGPT_URL]).stdout.strip()
     (ok if codex == EXPECTED_CHATGPT else fail)(f"Hermes Codex API: HTTP {codex}")
     if codex != EXPECTED_CHATGPT:
-        issues.append(("Codex API", "journalctl -u sing-box -u xray-hermes -n 100 --no-pager"))
+        issues.append(("Codex API", "journalctl -u sing-box -u xray -n 100 --no-pager"))
     gemini = run(["curl", "--noproxy", "*", "--http2", "-L", "--max-redirs", "3", "--connect-timeout", "7", "--max-time", "15", "-sS", "-o", "/dev/null", "-w", "%{http_code}", GEMINI_URL]).stdout.strip()
     (ok if gemini == EXPECTED_GEMINI else fail)(f"Gemini Web: HTTP {gemini}")
     if gemini != EXPECTED_GEMINI:
@@ -624,7 +714,47 @@ def base_sing_config():
 
 
 def xray_service_unit():
-    return """[Unit]\nDescription=Xray SOCKS for Hermes\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nDynamicUser=yes\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\nLoadCredential=config.json:/etc/xray-hermes/config.json\nExecStart=/usr/local/bin/xray-hermes run -c %d/config.json\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"""
+    return f"""[Unit]\nDescription=Xray SOCKS for Hermes\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nDynamicUser=yes\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\nLoadCredential=config.json:{XRAY_CONFIG}\nExecStart={XRAY_BIN} run -c %d/config.json\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"""
+
+
+def migrate_legacy_xray(run_command=None, state_reader=None):
+    """Move the managed Xray installation to standard names, preserving state."""
+    legacy_paths = (LEGACY_XRAY_CONFIG_DIR, LEGACY_XRAY_BIN, LEGACY_XRAY_UNIT)
+    if not any(path.exists() for path in legacy_paths):
+        return False
+    conflicts = []
+    for legacy, current in (
+        (LEGACY_XRAY_CONFIG_DIR, XRAY_CONFIG.parent),
+        (LEGACY_XRAY_BIN, XRAY_BIN),
+        (LEGACY_XRAY_UNIT, XRAY_UNIT),
+    ):
+        if legacy.exists() and current.exists():
+            conflicts.append(f"{legacy} и {current}")
+    if conflicts:
+        raise RuntimeError("обнаружены конфликтующие Xray-пути: " + ", ".join(conflicts))
+
+    runner = run_command or run
+    reader = state_reader or service_state
+    legacy_active, legacy_enabled = reader("xray-hermes.service")
+    if legacy_active == "active":
+        runner(["systemctl", "stop", "xray-hermes.service"], check=True)
+
+    if LEGACY_XRAY_CONFIG_DIR.exists():
+        XRAY_CONFIG.parent.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(LEGACY_XRAY_CONFIG_DIR), str(XRAY_CONFIG.parent))
+    if LEGACY_XRAY_BIN.exists():
+        XRAY_BIN.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(LEGACY_XRAY_BIN), str(XRAY_BIN))
+    XRAY_UNIT.parent.mkdir(parents=True, exist_ok=True)
+    XRAY_UNIT.write_text(xray_service_unit())
+    if LEGACY_XRAY_UNIT.exists():
+        runner(["systemctl", "disable", "xray-hermes.service"])
+        LEGACY_XRAY_UNIT.unlink()
+    runner(["systemctl", "daemon-reload"], check=True)
+    runner(["systemctl", "enable" if legacy_enabled == "enabled" else "disable", "xray.service"], check=True)
+    runner(["systemctl", "restart" if legacy_active == "active" else "stop", "xray.service"], check=True)
+    ok("Xray переименован: xray.service, /usr/local/bin/xray, /etc/xray")
+    return True
 
 
 def repair_installation():
@@ -634,9 +764,10 @@ def repair_installation():
     if safe_input("Продолжить? [y/N]: ").strip().lower() not in {"y", "yes", "д", "да"}:
         warn("отменено")
         return
-    if not command_exists("/usr/bin/sing-box") or not command_exists("/usr/local/bin/xray-hermes") or not command_exists(str(CORE)):
-        raise RuntimeError("сначала установите отсутствующие бинарники, указанные диагностикой")
     ensure_session_backup()
+    migrate_legacy_xray()
+    if not command_exists("/usr/bin/sing-box") or not command_exists(str(XRAY_BIN)) or not command_exists(str(CORE)):
+        raise RuntimeError("сначала установите отсутствующие бинарники, указанные диагностикой")
     SOURCE.parent.mkdir(parents=True, exist_ok=True)
     if not SOURCE.exists():
         SOURCE.touch(mode=0o600)
@@ -661,7 +792,7 @@ def repair_installation():
             shutil.copy2(XRAY_UNIT, XRAY_UNIT.with_name(f"{XRAY_UNIT.name}.bak-{stamp}"))
         XRAY_UNIT.write_text(unit)
     run(["systemctl", "daemon-reload"], check=True)
-    run(["systemctl", "enable", "sing-box.service", "xray-hermes.service"], check=True)
+    run(["systemctl", "enable", "sing-box.service", "xray.service"], check=True)
     ok("базовая конфигурация и автозапуск подготовлены")
     diagnostics()
 
@@ -675,14 +806,16 @@ def create_full_backup(label):
     archive = BACKUP_DIR / f"{label}-{stamp}.tar.gz"
     candidates = [
         SOURCE, SING_CONFIG.parent, XRAY_CONFIG.parent, XRAY_UNIT,
-        STATE_DIR, Path("/var/lib/sing-box"), Path("/usr/local/bin/xray-hermes"),
+        LEGACY_XRAY_CONFIG_DIR, LEGACY_XRAY_UNIT,
+        STATE_DIR, Path("/var/lib/sing-box"), XRAY_BIN, LEGACY_XRAY_BIN,
         CORE,
     ]
     package = run(["dpkg-query", "-W", "-f=${Status}|${Version}", "sing-box"])
     package_fields = package.stdout.strip().split("|", 1)
     package_installed = package.returncode == 0 and package_fields[0] == "install ok installed"
     sing_active, sing_enabled = service_state("sing-box.service")
-    xray_active, xray_enabled = service_state("xray-hermes.service")
+    xray_active, xray_enabled = service_state("xray.service")
+    legacy_xray_active, legacy_xray_enabled = service_state("xray-hermes.service")
     metadata = {
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "label": label,
@@ -690,7 +823,11 @@ def create_full_backup(label):
         "sing_box_package": {"installed": package_installed, "version": package_fields[1] if package_installed and len(package_fields) > 1 else None},
         "services": {
             "sing-box.service": {"active": sing_active == "active", "enabled": sing_enabled == "enabled"},
-            "xray-hermes.service": {"active": xray_active == "active", "enabled": xray_enabled == "enabled"},
+            "xray.service": {"active": xray_active == "active", "enabled": xray_enabled == "enabled"},
+            "xray-hermes.service": {
+                "active": legacy_xray_active == "active",
+                "enabled": legacy_xray_enabled == "enabled",
+            },
         },
     }
     with tarfile.open(archive, "w:gz") as tar:
@@ -715,10 +852,16 @@ def ensure_session_backup():
 
 
 def remove_managed_paths():
-    for path in [SING_CONFIG.parent, XRAY_CONFIG.parent, STATE_DIR, Path("/var/lib/sing-box")]:
+    for path in [
+        SING_CONFIG.parent,
+        XRAY_CONFIG.parent,
+        LEGACY_XRAY_CONFIG_DIR,
+        STATE_DIR,
+        Path("/var/lib/sing-box"),
+    ]:
         if path.exists():
             shutil.rmtree(path)
-    for path in [XRAY_UNIT, Path("/usr/local/bin/xray-hermes"), SOURCE, CORE]:
+    for path in [XRAY_UNIT, LEGACY_XRAY_UNIT, XRAY_BIN, LEGACY_XRAY_BIN, SOURCE, CORE]:
         path.unlink(missing_ok=True)
 
 
@@ -739,7 +882,7 @@ def rollback_session():
         raise RuntimeError(f"отсутствуют метаданные снимка: {metadata_path}")
     metadata = json.loads(metadata_path.read_text())
     try:
-        run(["systemctl", "stop", "sing-box.service", "xray-hermes.service"])
+        run(["systemctl", "stop", "sing-box.service", "xray.service", "xray-hermes.service"])
         package = metadata["sing_box_package"]
         current = run(["dpkg-query", "-W", "-f=${Status}|${Version}", "sing-box"])
         current_installed = current.returncode == 0 and current.stdout.startswith("install ok installed|")
@@ -782,8 +925,17 @@ def restore_backup(archive, restore_service_state=True):
         tar.extractall("/")
     run(["systemctl", "daemon-reload"])
     if restore_service_state:
-        run(["systemctl", "enable", "sing-box.service", "xray-hermes.service"])
-        run(["systemctl", "restart", "xray-hermes.service", "sing-box.service"])
+        metadata_path = Path(str(archive) + ".json")
+        if metadata_path.exists():
+            services = json.loads(metadata_path.read_text()).get("services", {})
+        else:
+            services = {
+                "sing-box.service": {"active": True, "enabled": True},
+                "xray.service": {"active": True, "enabled": True},
+            }
+        for service, state in services.items():
+            run(["systemctl", "enable" if state.get("enabled") else "disable", service])
+            run(["systemctl", "restart" if state.get("active") else "stop", service])
 
 
 def ensure_required_packages(
@@ -934,9 +1086,9 @@ def install_xray_latest():
             if not member:
                 raise RuntimeError("в архиве Xray отсутствует бинарник")
             extracted = Path(zip_file.extract(member, tmp))
-        Path("/usr/local/bin").mkdir(parents=True, exist_ok=True)
-        shutil.copy2(extracted, "/usr/local/bin/xray-hermes")
-        os.chmod("/usr/local/bin/xray-hermes", 0o755)
+        XRAY_BIN.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(extracted, XRAY_BIN)
+        os.chmod(XRAY_BIN, 0o755)
     ok(f"Xray {release.get('tag_name')} установлен, SHA256 проверен")
 
 
@@ -956,7 +1108,7 @@ def write_clean_base(keep_links=True):
     XRAY_UNIT.parent.mkdir(parents=True, exist_ok=True)
     XRAY_UNIT.write_text(unit)
     run(["systemctl", "daemon-reload"], check=True)
-    run(["systemctl", "enable", "sing-box.service", "xray-hermes.service"], check=True)
+    run(["systemctl", "enable", "sing-box.service", "xray.service"], check=True)
 
 
 def full_cleanup():
@@ -965,7 +1117,7 @@ def full_cleanup():
     heading("ПОЛНОЕ УДАЛЕНИЕ VPN")
     print("Будут остановлены и удалены:")
     print("  • sing-box package и его конфигурация/state")
-    print("  • xray-hermes unit, бинарник и конфигурация")
+    print("  • xray unit, бинарник и конфигурация")
     print("  • VLESS-ссылки и результаты тестов")
     print("Менеджер и core-установщик останутся для последующей чистой установки.")
     if not confirm_phrase("VPN немедленно перестанет работать. Данные будут доступны только в backup.", "УДАЛИТЬ VPN"):
@@ -973,18 +1125,35 @@ def full_cleanup():
         return
     ensure_session_backup()
     archive = create_full_backup("before-cleanup")
-    run(["systemctl", "disable", "--now", "sing-box.service", "xray-hermes.service"])
+    run(["systemctl", "disable", "--now", "sing-box.service", "xray.service", "xray-hermes.service"])
     apt = run(["apt-get", "purge", "-y", "sing-box"], timeout=300)
     if apt.returncode:
         warn("apt purge sing-box завершился с ошибкой: " + (apt.stderr or apt.stdout).strip())
-    for path in [SING_CONFIG.parent, XRAY_CONFIG.parent, STATE_DIR, Path("/var/lib/sing-box")]:
+    for path in [
+        SING_CONFIG.parent,
+        XRAY_CONFIG.parent,
+        LEGACY_XRAY_CONFIG_DIR,
+        STATE_DIR,
+        Path("/var/lib/sing-box"),
+    ]:
         if path.exists():
             shutil.rmtree(path)
-    for path in [XRAY_UNIT, Path("/usr/local/bin/xray-hermes"), SOURCE]:
+    for path in [XRAY_UNIT, LEGACY_XRAY_UNIT, XRAY_BIN, LEGACY_XRAY_BIN, SOURCE]:
         path.unlink(missing_ok=True)
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "reset-failed"])
-    remaining = [p for p in [SING_CONFIG, XRAY_CONFIG, XRAY_UNIT, Path("/usr/local/bin/xray-hermes"), SOURCE] if p.exists()]
+    remaining = [
+        p for p in [
+            SING_CONFIG,
+            XRAY_CONFIG,
+            LEGACY_XRAY_CONFIG_DIR,
+            XRAY_UNIT,
+            LEGACY_XRAY_UNIT,
+            XRAY_BIN,
+            LEGACY_XRAY_BIN,
+            SOURCE,
+        ] if p.exists()
+    ]
     if remaining:
         raise RuntimeError("не все объекты удалены: " + ", ".join(map(str, remaining)))
     ok("VPN-сервисы и данные полностью удалены")
@@ -1003,7 +1172,8 @@ def clean_install():
     ensure_session_backup()
     archive = create_full_backup("before-clean-install")
     try:
-        run(["systemctl", "stop", "sing-box.service", "xray-hermes.service"])
+        run(["systemctl", "stop", "sing-box.service", "xray.service", "xray-hermes.service"])
+        migrate_legacy_xray()
         ensure_required_packages()
         install_xray_latest()
         if not CORE.exists():
@@ -1017,7 +1187,7 @@ def clean_install():
         if raw_links:
             apply_best(interactive=False)
         else:
-            run(["systemctl", "enable", "--now", "sing-box.service", "xray-hermes.service"], check=True)
+            run(["systemctl", "enable", "--now", "sing-box.service", "xray.service"], check=True)
             warn("VLESS-ссылок нет: запущена базовая конфигурация без VPN")
         diagnostics()
         ok("чистая установка завершена и проверена")
@@ -1032,7 +1202,7 @@ def clean_install():
 
 
 def verify_runtime(expected=None):
-    for service in ("sing-box.service", "xray-hermes.service"):
+    for service in ("sing-box.service", "xray.service"):
         active = run(["systemctl", "is-active", service]).stdout.strip()
         if active != "active":
             raise RuntimeError(f"{service} не active: {active}")
@@ -1050,13 +1220,13 @@ def verify_runtime(expected=None):
 def show_errors():
     print("\n=== sing-box ===")
     print(run(["journalctl", "-u", "sing-box", "-n", "80", "--no-pager", "-p", "warning"]).stdout or "Нет warning/error")
-    print("\n=== xray-hermes ===")
-    print(run(["journalctl", "-u", "xray-hermes", "-n", "80", "--no-pager", "-p", "warning"]).stdout or "Нет warning/error")
+    print("\n=== xray ===")
+    print(run(["journalctl", "-u", "xray", "-n", "80", "--no-pager", "-p", "warning"]).stdout or "Нет warning/error")
     print("Команды исправления после диагностики:")
     print("  sing-box check -c /etc/sing-box/config.json")
-    print("  /usr/local/bin/xray-hermes run -test -c /etc/xray-hermes/config.json")
-    print("  systemctl restart xray-hermes sing-box")
-    print("  journalctl -u sing-box -u xray-hermes -n 100 --no-pager")
+    print("  /usr/local/bin/xray run -test -c /etc/xray/config.json")
+    print("  systemctl restart xray sing-box")
+    print("  journalctl -u sing-box -u xray -n 100 --no-pager")
 
 
 def self_test():
@@ -1094,6 +1264,7 @@ def menu():
         print(color("\n  УСТАНОВКА И ОБСЛУЖИВАНИЕ", C_MAGENTA + C_BOLD))
         print("   9. Исправить базовую конфигурацию и автозапуск")
         print("  10. Чистая переустановка VPN")
+        print("  14. Управление службами и автозапуском")
         print(color("  11. ПОЛНОСТЬЮ УДАЛИТЬ VPN", C_RED + C_BOLD))
         print(color("  12. Откатить все изменения текущего запуска", C_YELLOW + C_BOLD))
         print("\n   0. Выход\n")
@@ -1110,6 +1281,7 @@ def menu():
             elif choice == "8": apply_best(interactive=True)
             elif choice == "9": repair_installation()
             elif choice == "10": clean_install()
+            elif choice == "14": service_management_menu()
             elif choice == "11": full_cleanup()
             elif choice == "12": rollback_session()
             elif choice == "0": return

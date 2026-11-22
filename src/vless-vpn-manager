@@ -8,6 +8,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -25,6 +26,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 CORE = Path(os.environ.get("VLESS_MANAGER_CORE", "/usr/local/sbin/update-remnawave-nodes"))
+CORE_API_VERSION = 2
+CORE_DOWNLOAD_URL = os.environ.get(
+    "VLESS_MANAGER_CORE_URL",
+    "https://raw.githubusercontent.com/danissinad1/vless_vpn_manager/main/src/update-remnawave-nodes",
+)
 SOURCE = Path(os.environ.get("VLESS_LINKS_FILE", "/etc/vless-vpn-manager/links.txt"))
 SING_CONFIG = Path(os.environ.get("VLESS_SING_CONFIG", "/etc/sing-box/config.json"))
 XRAY_CONFIG = Path(os.environ.get("VLESS_XRAY_CONFIG", "/etc/xray/config.json"))
@@ -139,10 +145,65 @@ def require_root():
         raise RuntimeError("запустите скрипт от root: sudo vless-vpn-manager")
 
 
-def load_core():
+def import_core():
     if not CORE.is_file():
         raise RuntimeError(f"не найден модуль генерации {CORE}")
-    return importlib.machinery.SourceFileLoader("vless_vpn_core", str(CORE)).load_module()
+    module_name = f"vless_vpn_core_{time.time_ns()}"
+    loader = importlib.machinery.SourceFileLoader(module_name, str(CORE))
+    spec = importlib.util.spec_from_loader(module_name, loader)
+    if spec is None:
+        raise RuntimeError(f"не удалось подготовить загрузку core-компонента {CORE}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def update_installed_core():
+    request = urllib.request.Request(CORE_DOWNLOAD_URL, headers={"User-Agent": "vless-vpn-manager"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read(2 * 1024 * 1024 + 1)
+    except Exception as exc:
+        raise RuntimeError(
+            f"установленный core устарел, но обновление не удалось: {exc}; "
+            "переустановите менеджер через install.sh"
+        ) from exc
+    if len(payload) > 2 * 1024 * 1024:
+        raise RuntimeError("загруженный core превышает допустимый размер 2 МБ")
+    try:
+        compile(payload, CORE_DOWNLOAD_URL, "exec")
+    except (SyntaxError, ValueError) as exc:
+        raise RuntimeError(f"загруженный core содержит синтаксическую ошибку: {exc}") from exc
+    match = re.search(rb"^CORE_API_VERSION\s*=\s*(\d+)\s*$", payload, re.MULTILINE)
+    downloaded_version = int(match.group(1)) if match else 0
+    if downloaded_version != CORE_API_VERSION:
+        raise RuntimeError(
+            f"репозиторий отдал несовместимую версию core: {downloaded_version}, "
+            f"ожидалась {CORE_API_VERSION}"
+        )
+    CORE.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=CORE.parent, delete=False) as fh:
+            temp_path = Path(fh.name)
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temp_path, 0o755)
+        os.replace(temp_path, CORE)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+    ok(f"core-компонент обновлён: {CORE}")
+
+
+def load_core():
+    core = import_core()
+    if getattr(core, "CORE_API_VERSION", 0) == CORE_API_VERSION:
+        return core
+    warn("установлен устаревший core-компонент; обновляю его из репозитория")
+    update_installed_core()
+    return import_core()
 
 
 def protocol_name(item, kind=None):
@@ -640,6 +701,7 @@ def service_action_menu(service, label):
     }
     while True:
         clear_screen()
+        dashboard()
         heading(f"УПРАВЛЕНИЕ {label.upper()}")
         active, enabled = service_state(service)
         print(f"Состояние:   {status_text(active == 'active', 'РАБОТАЕТ', 'ОСТАНОВЛЕНА')}")
@@ -671,6 +733,7 @@ def service_action_menu(service, label):
 def service_management_menu():
     while True:
         clear_screen()
+        dashboard()
         heading("УПРАВЛЕНИЕ СЛУЖБАМИ")
         for label, service in (("sing-box", "sing-box.service"), ("xray", "xray.service")):
             active, enabled = service_state(service)
@@ -1288,45 +1351,51 @@ def self_test():
     ok("self-test пройден")
 
 
+def print_main_menu():
+    print(color("\n  ДИАГНОСТИКА", C_CYAN + C_BOLD))
+    print("   1. Полная диагностика установки и подключения")
+    print("   2. Показать ошибки сервисов и команды исправления")
+    print("   3. Проверить текущий доступ: ChatGPT + Gemini + YouTube")
+    print(color("\n  VLESS-СЕРВЕРЫ", C_CYAN + C_BOLD))
+    print("   4. Показать ссылки (UUID скрыты)")
+    print("   5. Добавить ссылки")
+    print("   6. Редактировать ссылку")
+    print("   7. Удалить ссылки")
+    print("   8. Проверить все узлы: ChatGPT + Gemini")
+    print("   9. Автовыбор и применение лучших узлов")
+    print(color("\n  УСТАНОВКА И ОБСЛУЖИВАНИЕ", C_MAGENTA + C_BOLD))
+    print("  10. Исправить базовую конфигурацию и автозапуск")
+    print("  11. Чистая переустановка VPN")
+    print("  12. Управление службами и автозапуском")
+    print(color("  13. ПОЛНОСТЬЮ УДАЛИТЬ VPN", C_RED + C_BOLD))
+    print(color("  14. Откатить все изменения текущего запуска", C_YELLOW + C_BOLD))
+    print("\n   0. Выход\n")
+
+
 def menu():
     require_root()
     while True:
         clear_screen()
         dashboard()
-        print(color("\n  ДИАГНОСТИКА", C_CYAN + C_BOLD))
-        print("   1. Полная диагностика установки и подключения")
-        print("   2. Показать ошибки сервисов и команды исправления")
-        print("  13. Проверить текущий доступ: ChatGPT + Gemini + YouTube")
-        print(color("\n  VLESS-СЕРВЕРЫ", C_CYAN + C_BOLD))
-        print("   3. Показать ссылки (UUID скрыты)")
-        print("   4. Добавить ссылки")
-        print("   5. Редактировать ссылку")
-        print("   6. Удалить ссылки")
-        print("   7. Проверить все узлы: ChatGPT + Gemini")
-        print("   8. Автовыбор и применение лучших узлов")
-        print(color("\n  УСТАНОВКА И ОБСЛУЖИВАНИЕ", C_MAGENTA + C_BOLD))
-        print("   9. Исправить базовую конфигурацию и автозапуск")
-        print("  10. Чистая переустановка VPN")
-        print("  14. Управление службами и автозапуском")
-        print(color("  11. ПОЛНОСТЬЮ УДАЛИТЬ VPN", C_RED + C_BOLD))
-        print(color("  12. Откатить все изменения текущего запуска", C_YELLOW + C_BOLD))
-        print("\n   0. Выход\n")
+        print_main_menu()
         choice = safe_input("Выбор: ").strip()
         try:
             if choice == "1": diagnostics()
             elif choice == "2": show_errors()
-            elif choice == "13": check_service_connectivity()
-            elif choice == "3": list_links()
-            elif choice == "4": add_links()
-            elif choice == "5": edit_link()
-            elif choice == "6": delete_links()
-            elif choice == "7": test_nodes()
-            elif choice == "8": apply_best(interactive=True)
-            elif choice == "9": repair_installation()
-            elif choice == "10": clean_install()
-            elif choice == "14": service_management_menu()
-            elif choice == "11": full_cleanup()
-            elif choice == "12": rollback_session()
+            elif choice == "3": check_service_connectivity()
+            elif choice == "4": list_links()
+            elif choice == "5": add_links()
+            elif choice == "6": edit_link()
+            elif choice == "7": delete_links()
+            elif choice == "8": test_nodes()
+            elif choice == "9": apply_best(interactive=True)
+            elif choice == "10": repair_installation()
+            elif choice == "11": clean_install()
+            elif choice == "12":
+                service_management_menu()
+                continue
+            elif choice == "13": full_cleanup()
+            elif choice == "14": rollback_session()
             elif choice == "0": return
             else: warn("неизвестный пункт")
         except Exception as exc:

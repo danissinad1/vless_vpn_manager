@@ -4,6 +4,7 @@ import hashlib
 import importlib.machinery
 import io
 import json
+import re
 import tempfile
 import unittest
 import uuid
@@ -59,6 +60,169 @@ class DashboardTests(unittest.TestCase):
         sing_box = next(line for line in lines if line.startswith("sing-box:"))
         xray = next(line for line in lines if line.startswith("xray:"))
         self.assertEqual(sing_box.index("●"), xray.index("●"))
+
+
+class MenuTests(unittest.TestCase):
+    def test_main_menu_numbers_are_sequential(self):
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            MANAGER.print_main_menu()
+
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+        numbers = [int(match.group(1)) for match in re.finditer(r"^\s*(\d+)\.", plain, re.MULTILINE)]
+        self.assertEqual(numbers, list(range(1, 15)) + [0])
+
+    def test_service_management_menu_shows_dashboard(self):
+        with patch.object(MANAGER, "dashboard") as dashboard, patch.object(
+            MANAGER, "clear_screen"
+        ), patch.object(
+            MANAGER, "service_state", return_value=("active", "enabled")
+        ), patch.object(
+            MANAGER, "safe_input", return_value="0"
+        ):
+            MANAGER.service_management_menu()
+
+        dashboard.assert_called_once_with()
+
+    def test_service_action_menu_shows_dashboard(self):
+        with patch.object(MANAGER, "dashboard") as dashboard, patch.object(
+            MANAGER, "clear_screen"
+        ), patch.object(
+            MANAGER, "service_state", return_value=("active", "enabled")
+        ), patch.object(
+            MANAGER, "safe_input", return_value="0"
+        ):
+            MANAGER.service_action_menu("xray.service", "xray")
+
+        dashboard.assert_called_once_with()
+
+    def test_return_from_service_menu_does_not_pause(self):
+        with patch.object(MANAGER, "require_root"), patch.object(
+            MANAGER, "clear_screen"
+        ), patch.object(
+            MANAGER, "dashboard"
+        ), patch.object(
+            MANAGER, "print_main_menu"
+        ), patch.object(
+            MANAGER, "service_management_menu"
+        ), patch.object(
+            MANAGER, "pause_before_menu"
+        ) as pause, patch.object(
+            MANAGER, "safe_input", side_effect=["12", "0"]
+        ):
+            MANAGER.menu()
+
+        pause.assert_not_called()
+
+    def test_main_menu_numbers_dispatch_to_matching_actions(self):
+        cases = [
+            ("1", "diagnostics", None),
+            ("2", "show_errors", None),
+            ("3", "check_service_connectivity", None),
+            ("4", "list_links", None),
+            ("5", "add_links", None),
+            ("6", "edit_link", None),
+            ("7", "delete_links", None),
+            ("8", "test_nodes", None),
+            ("9", "apply_best", {"interactive": True}),
+            ("10", "repair_installation", None),
+            ("11", "clean_install", None),
+            ("12", "service_management_menu", None),
+            ("13", "full_cleanup", None),
+            ("14", "rollback_session", None),
+        ]
+
+        for choice, action, kwargs in cases:
+            with self.subTest(choice=choice), patch.object(
+                MANAGER, "require_root"
+            ), patch.object(
+                MANAGER, "clear_screen"
+            ), patch.object(
+                MANAGER, "dashboard"
+            ), patch.object(
+                MANAGER, "print_main_menu"
+            ), patch.object(
+                MANAGER, "pause_before_menu"
+            ), patch.object(
+                MANAGER, "safe_input", side_effect=[choice, "0"]
+            ), patch.object(
+                MANAGER, action
+            ) as handler:
+                MANAGER.menu()
+
+            if kwargs is None:
+                handler.assert_called_once_with()
+            else:
+                handler.assert_called_once_with(**kwargs)
+
+
+class CoreLoadingTests(unittest.TestCase):
+    def test_replaces_stale_installed_core_before_loading(self):
+        current_core = b"CORE_API_VERSION = 2\nXRAY_BIN = '/usr/local/bin/xray'\n"
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return current_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            core_path = Path(tmp) / "update-remnawave-nodes"
+            core_path.write_text("XRAY_BIN = '/usr/local/bin/xray-hermes'\n")
+            with patch.object(MANAGER, "CORE", core_path), patch.object(
+                MANAGER.urllib.request, "urlopen", return_value=Response()
+            ) as urlopen:
+                core = MANAGER.load_core()
+
+            self.assertEqual(core.CORE_API_VERSION, MANAGER.CORE_API_VERSION)
+            self.assertEqual(core.XRAY_BIN, "/usr/local/bin/xray")
+            self.assertEqual(core_path.read_bytes(), current_core)
+            self.assertEqual(core_path.stat().st_mode & 0o777, 0o755)
+            urlopen.assert_called_once()
+
+    def test_does_not_download_matching_installed_core(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            core_path = Path(tmp) / "update-remnawave-nodes"
+            core_path.write_text(
+                f"CORE_API_VERSION = {MANAGER.CORE_API_VERSION}\n"
+                "XRAY_BIN = '/usr/local/bin/xray'\n"
+            )
+            with patch.object(MANAGER, "CORE", core_path), patch.object(
+                MANAGER.urllib.request, "urlopen"
+            ) as urlopen:
+                core = MANAGER.load_core()
+
+            self.assertEqual(core.CORE_API_VERSION, MANAGER.CORE_API_VERSION)
+            urlopen.assert_not_called()
+
+    def test_rejects_incompatible_download_without_overwriting_core(self):
+        stale_content = "XRAY_BIN = '/usr/local/bin/xray-hermes'\n"
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return b"CORE_API_VERSION = 1\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            core_path = Path(tmp) / "update-remnawave-nodes"
+            core_path.write_text(stale_content)
+            with patch.object(MANAGER, "CORE", core_path), patch.object(
+                MANAGER.urllib.request, "urlopen", return_value=Response()
+            ):
+                with self.assertRaisesRegex(RuntimeError, "несовместимую версию"):
+                    MANAGER.load_core()
+
+            self.assertEqual(core_path.read_text(), stale_content)
 
 
 class DependencyPreflightTests(unittest.TestCase):

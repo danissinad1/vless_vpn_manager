@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+CORE_API_VERSION = 2
 SOURCE = Path(os.environ.get("VLESS_LINKS_FILE", "/etc/vless-vpn-manager/links.txt"))
 SING_CONFIG = Path(os.environ.get("VLESS_SING_CONFIG", "/etc/sing-box/config.json"))
 XRAY_CONFIG = Path(os.environ.get("VLESS_XRAY_CONFIG", "/etc/xray/config.json"))

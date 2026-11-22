@@ -623,6 +623,10 @@ def base_sing_config():
     }
 
 
+def xray_service_unit():
+    return """[Unit]\nDescription=Xray SOCKS for Hermes\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nDynamicUser=yes\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\nAmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\nLoadCredential=config.json:/etc/xray-hermes/config.json\nExecStart=/usr/local/bin/xray-hermes run -c %d/config.json\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"""
+
+
 def repair_installation():
     require_root()
     diagnostics(show_fixes=False)
@@ -650,7 +654,7 @@ def repair_installation():
     if not XRAY_CONFIG.exists():
         XRAY_CONFIG.write_text(json.dumps({"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": [], "routing": {"domainStrategy": "AsIs", "rules": []}}, indent=2) + "\n")
         os.chmod(XRAY_CONFIG, 0o600)
-    unit = """[Unit]\nDescription=Xray SOCKS for Hermes\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nDynamicUser=yes\nLoadCredential=config.json:/etc/xray-hermes/config.json\nExecStart=/usr/local/bin/xray-hermes run -c %d/config.json\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"""
+    unit = xray_service_unit()
     if not XRAY_UNIT.exists() or XRAY_UNIT.read_text() != unit:
         if XRAY_UNIT.exists():
             stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -948,7 +952,7 @@ def write_clean_base(keep_links=True):
     XRAY_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     XRAY_CONFIG.write_text(json.dumps({"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": [], "routing": {"domainStrategy": "AsIs", "rules": []}}, indent=2) + "\n")
     os.chmod(XRAY_CONFIG, 0o600)
-    unit = """[Unit]\nDescription=Xray SOCKS for Hermes\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nDynamicUser=yes\nLoadCredential=config.json:/etc/xray-hermes/config.json\nExecStart=/usr/local/bin/xray-hermes run -c %d/config.json\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"""
+    unit = xray_service_unit()
     XRAY_UNIT.parent.mkdir(parents=True, exist_ok=True)
     XRAY_UNIT.write_text(unit)
     run(["systemctl", "daemon-reload"], check=True)

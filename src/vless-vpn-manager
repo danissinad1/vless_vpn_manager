@@ -2,9 +2,11 @@
 """Interactive VLESS VPN manager for sing-box + Xray XHTTP."""
 
 import argparse
+import base64
 import concurrent.futures
 import datetime as dt
 import fcntl
+import hashlib
 import importlib.machinery
 import json
 import os
@@ -266,19 +268,28 @@ def list_links():
 
 
 def add_links():
-    print("Вставляйте VLESS-ссылки по одной на строку. Пустая строка завершает ввод.")
+    print("Вставляйте VLESS-ссылки или HTTP(S)-ссылки подписки по одной на строку.")
+    print("Поддерживаются обычные и Base64-кодированные подписки. Пустая строка завершает ввод.")
     added = []
     while True:
         try:
-            raw = safe_input("vless> ").strip()
+            raw = safe_input("ссылка> ").strip()
         except EOFError:
             break
         if not raw:
             break
         try:
-            proto, host, port = summarize_uri(raw)
-            info(f"принято: {proto}, {host}:{port}")
-            added.append(raw)
+            if urlparse(raw).scheme.lower() in {"http", "https"}:
+                links = fetch_subscription(raw)
+                info(f"из подписки получено VLESS-ссылок: {len(links)}")
+                for link in links:
+                    proto, host, port = summarize_uri(link)
+                    info(f"принято: {proto}, {host}:{port}")
+                added.extend(links)
+            else:
+                proto, host, port = summarize_uri(raw)
+                info(f"принято: {proto}, {host}:{port}")
+                added.append(raw)
         except Exception as exc:
             fail(str(exc))
     if not added:
@@ -293,6 +304,43 @@ def add_links():
     ensure_session_backup()
     backup = write_source(lines + unique)
     ok(f"добавлено ссылок: {len(unique)}; backup: {backup}")
+
+
+def extract_subscription_links(payload):
+    """Extract unique VLESS URIs from plain text or a Base64 subscription."""
+    if len(payload) > 5 * 1024 * 1024:
+        raise ValueError("подписка больше 5 МБ")
+    candidates = [payload.decode("utf-8", errors="ignore")]
+    compact = re.sub(rb"\s+", b"", payload)
+    if compact:
+        try:
+            padded = compact + b"=" * (-len(compact) % 4)
+            candidates.append(base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+    links = []
+    seen = set()
+    for text in candidates:
+        for link in re.findall(r"vless://[^\s'\"<>]+", text, flags=re.IGNORECASE):
+            if link not in seen:
+                summarize_uri(link)
+                seen.add(link)
+                links.append(link)
+    if not links:
+        raise ValueError("в подписке не найдены корректные VLESS-ссылки")
+    return links
+
+
+def fetch_subscription(url):
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("поддерживаются только HTTP(S)-ссылки подписки")
+    request = urllib.request.Request(url, headers={"User-Agent": "vless-vpn-manager/1.0"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        if urlparse(response.geturl()).scheme.lower() not in {"http", "https"}:
+            raise ValueError("подписка перенаправила на небезопасную схему URL")
+        payload = response.read(5 * 1024 * 1024 + 1)
+    return extract_subscription_links(payload)
 
 
 def edit_link():
@@ -341,6 +389,45 @@ def curl_status(port, url, redirects=False):
         cmd += ["-L", "--max-redirs", "3"]
     result = run(cmd + [url], timeout=25)
     return result.stdout.strip() or f"curl:{result.returncode}"
+
+
+def check_service_connectivity(run_command=None, display=True):
+    """Check service accessibility through the route active right now."""
+    runner = run_command or run
+    services = [
+        ("ChatGPT", "https://chatgpt.com/cdn-cgi/trace"),
+        ("Gemini", "https://gemini.google.com/"),
+        ("YouTube", "https://www.youtube.com/generate_204"),
+    ]
+    if display:
+        heading("ТЕКУЩИЙ ДОСТУП К СЕРВИСАМ")
+        print("Проверяется текущий системный маршрут. Изменения конфигурации не выполняются.\n")
+    results = []
+    for name, url in services:
+        result = runner([
+            "curl", "--noproxy", "*", "--http2", "-L", "--max-redirs", "3",
+            "--connect-timeout", "7", "--max-time", "20", "-sS", "-o", "/dev/null",
+            "-w", "%{http_code}", url,
+        ], timeout=25)
+        raw = result.stdout.strip()
+        code = int(raw) if raw.isdigit() else 0
+        if result.returncode == 0 and 200 <= code < 400:
+            state = "available"
+            message = f"доступен, HTTP {code}"
+            printer = ok
+        elif 400 <= code < 500:
+            state = "restricted"
+            message = f"сервер отвечает, но доступ ограничен: HTTP {code}"
+            printer = warn
+        else:
+            state = "failed"
+            detail = (result.stderr or "нет HTTP-ответа").strip()
+            message = f"нет доступа, HTTP {raw or '000'}: {detail}"
+            printer = fail
+        results.append({"name": name, "url": url, "http": code, "state": state, "detail": message})
+        if display:
+            printer(f"{name}: {message}")
+    return results
 
 
 def service_probe(port):
@@ -670,12 +757,25 @@ def restore_backup(archive, restore_service_state=True):
         run(["systemctl", "restart", "xray-hermes.service", "sing-box.service"])
 
 
-def ensure_required_packages(run_command=None, downloader=None, keyring=None, source_file=None):
+def ensure_required_packages(
+    run_command=None, downloader=None, keyring=None, source_file=None,
+    architecture=None, release_loader=None,
+):
     """Install base tools and make sing-box available from its official APT repository."""
     runner = run_command or run
     downloader = downloader or urllib.request.urlretrieve
     keyring = Path(keyring or "/etc/apt/keyrings/sagernet.asc")
     source_file = Path(source_file or "/etc/apt/sources.list.d/sagernet.sources")
+
+    def default_release_loader():
+        request = urllib.request.Request(
+            "https://api.github.com/repos/SagerNet/sing-box/releases/latest",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "vless-vpn-manager/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+
+    release_loader = release_loader or default_release_loader
 
     if run_command is None and not shutil.which("apt-get"):
         raise RuntimeError("автоустановка пакетов поддерживается только на Debian/Ubuntu с APT")
@@ -685,8 +785,18 @@ def ensure_required_packages(run_command=None, downloader=None, keyring=None, so
         return versions.returncode == 0 and bool(versions.stdout.strip())
 
     info("проверка APT и обязательных пакетов")
-    runner(["apt-get", "update"], check=True, timeout=300)
-    runner(["apt-get", "install", "-y", "ca-certificates", "curl", "unzip"], check=True, timeout=300)
+    base_packages = ["ca-certificates", "curl", "unzip"]
+    missing = []
+    for package in base_packages:
+        status = runner(["dpkg-query", "-W", "-f=${db:Status-Status}", package])
+        if status.returncode != 0 or status.stdout.strip() != "installed":
+            missing.append(package)
+    if missing:
+        info("устанавливаю отсутствующие пакеты: " + ", ".join(missing))
+        runner(["apt-get", "update"], check=True, timeout=300)
+        runner(["apt-get", "install", "-y", *missing], check=True, timeout=300)
+    else:
+        ok("базовые пакеты уже установлены")
 
     if not sing_box_available():
         warn("пакет sing-box не найден; подключаю официальный репозиторий SagerNet")
@@ -719,12 +829,44 @@ Signed-By: {keyring}
         finally:
             temporary_source.unlink(missing_ok=True)
 
-        runner(["apt-get", "update"], check=True, timeout=300)
+        info("обновляю индекс только для репозитория SagerNet")
+        runner([
+            "apt-get", "-o", f"Dir::Etc::sourcelist={source_file}",
+            "-o", "Dir::Etc::sourceparts=-", "update",
+        ], check=True, timeout=300)
         if not sing_box_available():
-            raise RuntimeError("sing-box недоступен даже после подключения официального репозитория SagerNet")
-        ok("официальный репозиторий SagerNet подключён")
+            warn("APT-репозиторий не отдал sing-box; использую официальный .deb из GitHub Releases")
+            if architecture is None:
+                arch_result = runner(["dpkg", "--print-architecture"], check=True)
+                architecture = arch_result.stdout.strip()
+            release = release_loader()
+            assets = release.get("assets", [])
+            suffix = f"_linux_{architecture}.deb"
+            asset = next((item for item in assets if item.get("name", "").startswith("sing-box_") and item["name"].endswith(suffix)), None)
+            if not asset:
+                raise RuntimeError(f"в официальном релизе sing-box нет .deb для архитектуры {architecture}")
+            digest = asset.get("digest", "")
+            if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+                raise RuntimeError("GitHub API не вернул SHA256 для пакета sing-box")
+            with tempfile.NamedTemporaryFile(prefix="sing-box-", suffix=".deb", delete=False) as tmp:
+                package_path = Path(tmp.name)
+            try:
+                size_mb = asset.get("size", 0) / 1024 / 1024
+                info(f"скачиваю {asset['name']} ({size_mb:.1f} МБ)")
+                downloader(asset["browser_download_url"], package_path)
+                actual = hashlib.sha256(package_path.read_bytes()).hexdigest()
+                expected = digest.split(":", 1)[1].lower()
+                if actual != expected:
+                    raise RuntimeError(f"SHA256 пакета sing-box не совпал: {actual} != {expected}")
+                runner(["apt-get", "install", "-y", "--reinstall", str(package_path)], check=True, timeout=300)
+            finally:
+                package_path.unlink(missing_ok=True)
+            ok(f"sing-box установлен из проверенного официального релиза {release.get('tag_name', '')}")
+        else:
+            ok("официальный репозиторий SagerNet подключён")
 
-    runner(["apt-get", "install", "-y", "--reinstall", "sing-box"], check=True, timeout=300)
+    if sing_box_available():
+        runner(["apt-get", "install", "-y", "--reinstall", "sing-box"], check=True, timeout=300)
     installed = runner(["dpkg-query", "-W", "-f=${db:Status-Status}", "sing-box"])
     if installed.returncode != 0 or installed.stdout.strip() != "installed":
         raise RuntimeError("пакет sing-box не установлен после выполнения APT")
@@ -912,6 +1054,7 @@ def menu():
         print(color("\n  ДИАГНОСТИКА", C_CYAN + C_BOLD))
         print("   1. Полная диагностика установки и подключения")
         print("   2. Показать ошибки сервисов и команды исправления")
+        print("  13. Проверить текущий доступ: ChatGPT + Gemini + YouTube")
         print(color("\n  VLESS-СЕРВЕРЫ", C_CYAN + C_BOLD))
         print("   3. Показать ссылки (UUID скрыты)")
         print("   4. Добавить ссылки")
@@ -929,6 +1072,7 @@ def menu():
         try:
             if choice == "1": diagnostics()
             elif choice == "2": show_errors()
+            elif choice == "13": check_service_connectivity()
             elif choice == "3": list_links()
             elif choice == "4": add_links()
             elif choice == "5": edit_link()
@@ -956,6 +1100,7 @@ def main():
     group.add_argument("--clean-install", action="store_true")
     group.add_argument("--cleanup", action="store_true")
     group.add_argument("--list", action="store_true")
+    group.add_argument("--services", action="store_true")
     group.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -971,6 +1116,7 @@ def main():
         elif args.clean_install: clean_install()
         elif args.cleanup: full_cleanup()
         elif args.list: list_links()
+        elif args.services: check_service_connectivity()
         elif args.self_test: self_test()
         else: menu()
 

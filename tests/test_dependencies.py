@@ -145,6 +145,13 @@ class DependencyPreflightTests(unittest.TestCase):
 
 
 class SubscriptionTests(unittest.TestCase):
+    def test_normalizes_url_annotation_copied_from_chat(self):
+        annotated = "@url:`https://example.com/subscription-token`"
+        self.assertEqual(
+            MANAGER.normalize_pasted_link(annotated),
+            "https://example.com/subscription-token",
+        )
+
     def test_extracts_vless_links_from_base64_subscription(self):
         links = [
             "vless://first@example.com:443?security=tls&type=tcp#one",

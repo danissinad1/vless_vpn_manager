@@ -194,6 +194,12 @@ class ConnectivityTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
+    def test_xray_service_can_set_bypass_socket_mark(self):
+        unit = MANAGER.xray_service_unit()
+
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", unit)
+        self.assertIn("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW", unit)
+
     def test_applied_config_routes_tun_traffic_through_vpn_auto(self):
         native = [{
             "id": "test-node",

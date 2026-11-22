@@ -287,8 +287,15 @@ def add_links():
             break
         try:
             if urlparse(raw).scheme.lower() in {"http", "https"}:
-                links = fetch_subscription(raw)
+                links, rejected = fetch_subscription(raw, with_rejected=True)
                 info(f"из подписки получено VLESS-ссылок: {len(links)}")
+                if rejected:
+                    reasons = {}
+                    for _, reason in rejected:
+                        reasons[reason] = reasons.get(reason, 0) + 1
+                    warn(f"пропущено несовместимых VLESS-ссылок: {len(rejected)}")
+                    for reason, count in reasons.items():
+                        warn(f"{reason}: {count}")
                 for link in links:
                     proto, host, port = summarize_uri(link)
                     info(f"принято: {proto}, {host}:{port}")
@@ -313,7 +320,7 @@ def add_links():
     ok(f"добавлено ссылок: {len(unique)}; backup: {backup}")
 
 
-def extract_subscription_links(payload):
+def extract_subscription_links(payload, with_rejected=False):
     """Extract unique VLESS URIs from plain text or a Base64 subscription."""
     if len(payload) > 5 * 1024 * 1024:
         raise ValueError("подписка больше 5 МБ")
@@ -326,19 +333,30 @@ def extract_subscription_links(payload):
         except Exception:
             pass
     links = []
+    rejected = []
     seen = set()
     for text in candidates:
         for link in re.findall(r"vless://[^\s'\"<>]+", text, flags=re.IGNORECASE):
-            if link not in seen:
+            if link in seen:
+                continue
+            seen.add(link)
+            try:
                 summarize_uri(link)
-                seen.add(link)
                 links.append(link)
+            except ValueError as exc:
+                rejected.append((link, str(exc)))
     if not links:
-        raise ValueError("в подписке не найдены корректные VLESS-ссылки")
-    return links
+        if rejected:
+            reasons = ", ".join(sorted({reason for _, reason in rejected}))
+            raise ValueError(
+                f"в подписке нет поддерживаемых VLESS-ссылок; "
+                f"несовместимых: {len(rejected)} ({reasons})"
+            )
+        raise ValueError("в подписке не найдены VLESS-ссылки")
+    return (links, rejected) if with_rejected else links
 
 
-def fetch_subscription(url):
+def fetch_subscription(url, with_rejected=False):
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("поддерживаются только HTTP(S)-ссылки подписки")
@@ -347,7 +365,7 @@ def fetch_subscription(url):
         if urlparse(response.geturl()).scheme.lower() not in {"http", "https"}:
             raise ValueError("подписка перенаправила на небезопасную схему URL")
         payload = response.read(5 * 1024 * 1024 + 1)
-    return extract_subscription_links(payload)
+    return extract_subscription_links(payload, with_rejected=with_rejected)
 
 
 def edit_link():

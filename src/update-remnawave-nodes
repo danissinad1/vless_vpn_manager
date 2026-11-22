@@ -234,6 +234,9 @@ def build_configs(native, xhttp):
         "tolerance": 100,
     }
     sing["outbounds"] = managed + [selector] + preserved
+    # The base configuration uses direct only until working nodes are applied.
+    # Point all traffic not matched by an explicit rule at the tested selector.
+    sing.setdefault("route", {})["final"] = "vpn-auto"
 
     old_xray = json.loads(XRAY_CONFIG.read_text()) if XRAY_CONFIG.exists() else {}
     xray = {

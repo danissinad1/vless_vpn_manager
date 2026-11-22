@@ -18,6 +18,8 @@ python3 -m py_compile \
   "$ROOT_DIR/src/vless-vpn-manager" \
   "$ROOT_DIR/src/update-remnawave-nodes"
 
+python3 -m unittest -v "$ROOT_DIR/tests/test_dependencies.py"
+
 VLESS_LINKS_FILE="$TMP_DIR/links.txt" \
 VLESS_MANAGER_CORE="$ROOT_DIR/src/update-remnawave-nodes" \
 VLESS_MANAGER_LOCK_FILE="$TMP_DIR/manager.lock" \

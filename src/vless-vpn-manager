@@ -92,10 +92,21 @@ def confirm_phrase(description, phrase):
 def safe_input(prompt=""):
     """Read terminal bytes safely after partial UTF-8 backspace edits."""
     stream = getattr(sys.stdin, "buffer", None)
+    terminal_stream = None
+    if stream is not None and not sys.stdin.isatty():
+        try:
+            terminal_stream = open("/dev/tty", "rb", buffering=0)
+            stream = terminal_stream
+        except OSError:
+            pass
     if stream is None:
         return input(prompt)
     print(prompt, end="", flush=True)
-    raw = stream.readline()
+    try:
+        raw = stream.readline()
+    finally:
+        if terminal_stream is not None:
+            terminal_stream.close()
     if raw == b"":
         raise EOFError
     # In canonical TTY mode Backspace may remove only one byte of a
@@ -193,7 +204,7 @@ def dashboard():
         pass
     print(f"Сервер:             {color(host, C_CYAN)}")
     print(f"sing-box:           {status_text(sing_active == 'active')}  автозапуск={status_text(sing_enabled == 'enabled')}")
-    print(f"xray:        {status_text(xray_active == 'active')}  автозапуск={status_text(xray_enabled == 'enabled')}")
+    print(f"xray:               {status_text(xray_active == 'active')}  автозапуск={status_text(xray_enabled == 'enabled')}")
     print(f"VLESS-ссылки:       {unique_links} уникальных / {len(raw_links)} записей")
     print(f"Активные узлы:      {active_nodes}")
     print(f"Откат запуска:      {color('доступен', C_GREEN) if SESSION_BACKUP else color('снимок создастся перед первым изменением', C_DIM)}")
@@ -725,10 +736,10 @@ def diagnostics(show_fixes=True):
         (ok if result.returncode == 0 else fail)("синтаксис Xray" + ("" if result.returncode == 0 else f": {result.stderr.strip()}"))
         if result.returncode:
             issues.append(("Xray config", f"{XRAY_BIN} run -test -c {XRAY_CONFIG}"))
-    codex = run(["curl", "--noproxy", "*", "--http2", "--connect-timeout", "7", "--max-time", "15", "-sS", "-o", "/dev/null", "-w", "%{http_code}", CHATGPT_URL]).stdout.strip()
-    (ok if codex == EXPECTED_CHATGPT else fail)(f"Hermes Codex API: HTTP {codex}")
-    if codex != EXPECTED_CHATGPT:
-        issues.append(("Codex API", "journalctl -u sing-box -u xray -n 100 --no-pager"))
+    chatgpt = run(["curl", "--noproxy", "*", "--http2", "--connect-timeout", "7", "--max-time", "15", "-sS", "-o", "/dev/null", "-w", "%{http_code}", CHATGPT_URL]).stdout.strip()
+    (ok if chatgpt == EXPECTED_CHATGPT else fail)(f"Доступ к ChatGPT: HTTP {chatgpt}")
+    if chatgpt != EXPECTED_CHATGPT:
+        issues.append(("Доступ к ChatGPT", "journalctl -u sing-box -u xray -n 100 --no-pager"))
     gemini = run(["curl", "--noproxy", "*", "--http2", "-L", "--max-redirs", "3", "--connect-timeout", "7", "--max-time", "15", "-sS", "-o", "/dev/null", "-w", "%{http_code}", GEMINI_URL]).stdout.strip()
     (ok if gemini == EXPECTED_GEMINI else fail)(f"Gemini Web: HTTP {gemini}")
     if gemini != EXPECTED_GEMINI:

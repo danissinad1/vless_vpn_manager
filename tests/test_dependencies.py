@@ -2,9 +2,11 @@
 import base64
 import hashlib
 import importlib.machinery
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +24,40 @@ class FakeResult:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+class InputTests(unittest.TestCase):
+    def test_reads_from_controlling_terminal_when_script_arrives_on_stdin(self):
+        piped_stdin = io.TextIOWrapper(io.BytesIO(b""), encoding="utf-8")
+        terminal = io.BytesIO(b"13\n")
+
+        with patch.object(MANAGER.sys, "stdin", piped_stdin), patch(
+            "builtins.open", return_value=terminal
+        ) as open_terminal:
+            self.assertEqual(MANAGER.safe_input("Выбор: "), "13")
+
+        open_terminal.assert_called_once_with("/dev/tty", "rb", buffering=0)
+
+
+class DashboardTests(unittest.TestCase):
+    def test_service_status_values_start_in_same_column(self):
+        output = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            MANAGER, "SING_CONFIG", Path(tmp) / "missing-sing-box.json"
+        ), patch.object(
+            MANAGER, "RESULTS_FILE", Path(tmp) / "missing-results.json"
+        ), patch.object(
+            MANAGER, "source_lines", return_value=[]
+        ), patch.object(
+            MANAGER, "service_state", return_value=("inactive", "disabled")
+        ), redirect_stdout(output):
+            MANAGER.dashboard()
+
+        lines = output.getvalue().splitlines()
+        sing_box = next(line for line in lines if line.startswith("sing-box:"))
+        xray = next(line for line in lines if line.startswith("xray:"))
+        self.assertEqual(sing_box.index("●"), xray.index("●"))
 
 
 class DependencyPreflightTests(unittest.TestCase):

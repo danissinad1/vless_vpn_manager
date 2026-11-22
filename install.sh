@@ -17,8 +17,26 @@ for file in "$MANAGER_SRC" "$CORE_SRC"; do
   fi
 done
 
+required_packages=(python3 ca-certificates curl unzip)
+missing_packages=()
+for package in "${required_packages[@]}"; do
+  if ! dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null | grep -qx installed; then
+    missing_packages+=("$package")
+  fi
+done
+
+if ((${#missing_packages[@]})); then
+  command -v apt-get >/dev/null || {
+    echo "Ошибка: отсутствует APT; установите пакеты вручную: ${missing_packages[*]}" >&2
+    exit 1
+  }
+  echo "Устанавливаю обязательные пакеты: ${missing_packages[*]}"
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_packages[@]}"
+fi
+
 command -v python3 >/dev/null || {
-  echo "Ошибка: требуется Python 3" >&2
+  echo "Ошибка: Python 3 не установлен после проверки пакетов" >&2
   exit 1
 }
 
@@ -44,6 +62,6 @@ VLESS VPN Manager установлен.
 Список ссылок:
   /etc/vless-vpn-manager/links.txt
 
-Важно: перед чистой установкой убедитесь, что пакет sing-box
-доступен в настроенных APT-репозиториях.
+Важно: при чистой установке менеджер автоматически проверит пакеты
+и при необходимости подключит официальный репозиторий SagerNet.
 EOF

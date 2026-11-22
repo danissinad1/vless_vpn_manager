@@ -670,6 +670,67 @@ def restore_backup(archive, restore_service_state=True):
         run(["systemctl", "restart", "xray-hermes.service", "sing-box.service"])
 
 
+def ensure_required_packages(run_command=None, downloader=None, keyring=None, source_file=None):
+    """Install base tools and make sing-box available from its official APT repository."""
+    runner = run_command or run
+    downloader = downloader or urllib.request.urlretrieve
+    keyring = Path(keyring or "/etc/apt/keyrings/sagernet.asc")
+    source_file = Path(source_file or "/etc/apt/sources.list.d/sagernet.sources")
+
+    if run_command is None and not shutil.which("apt-get"):
+        raise RuntimeError("автоустановка пакетов поддерживается только на Debian/Ubuntu с APT")
+
+    def sing_box_available():
+        versions = runner(["apt-cache", "madison", "sing-box"])
+        return versions.returncode == 0 and bool(versions.stdout.strip())
+
+    info("проверка APT и обязательных пакетов")
+    runner(["apt-get", "update"], check=True, timeout=300)
+    runner(["apt-get", "install", "-y", "ca-certificates", "curl", "unzip"], check=True, timeout=300)
+
+    if not sing_box_available():
+        warn("пакет sing-box не найден; подключаю официальный репозиторий SagerNet")
+        keyring.parent.mkdir(parents=True, exist_ok=True)
+        source_file.parent.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(prefix="sagernet-key-", dir=keyring.parent, delete=False) as tmp:
+            temporary_key = Path(tmp.name)
+        try:
+            downloader("https://sing-box.app/gpg.key", temporary_key)
+            if not temporary_key.exists() or temporary_key.stat().st_size == 0:
+                raise RuntimeError("получен пустой ключ репозитория SagerNet")
+            os.chmod(temporary_key, 0o644)
+            os.replace(temporary_key, keyring)
+        finally:
+            temporary_key.unlink(missing_ok=True)
+
+        repository = f"""Types: deb
+URIs: https://deb.sagernet.org/
+Suites: *
+Components: *
+Enabled: yes
+Signed-By: {keyring}
+"""
+        temporary_source = source_file.with_name(source_file.name + ".tmp")
+        try:
+            temporary_source.write_text(repository)
+            os.chmod(temporary_source, 0o644)
+            os.replace(temporary_source, source_file)
+        finally:
+            temporary_source.unlink(missing_ok=True)
+
+        runner(["apt-get", "update"], check=True, timeout=300)
+        if not sing_box_available():
+            raise RuntimeError("sing-box недоступен даже после подключения официального репозитория SagerNet")
+        ok("официальный репозиторий SagerNet подключён")
+
+    runner(["apt-get", "install", "-y", "--reinstall", "sing-box"], check=True, timeout=300)
+    installed = runner(["dpkg-query", "-W", "-f=${db:Status-Status}", "sing-box"])
+    if installed.returncode != 0 or installed.stdout.strip() != "installed":
+        raise RuntimeError("пакет sing-box не установлен после выполнения APT")
+    ok("обязательные пакеты установлены")
+
+
 def install_xray_latest():
     arch_map = {"x86_64": "64", "amd64": "64", "aarch64": "arm64-v8a", "arm64": "arm64-v8a"}
     machine = os.uname().machine
@@ -772,9 +833,7 @@ def clean_install():
     archive = create_full_backup("before-clean-install")
     try:
         run(["systemctl", "stop", "sing-box.service", "xray-hermes.service"])
-        info("установка/обновление sing-box из настроенного APT-репозитория")
-        run(["apt-get", "update"], check=True, timeout=300)
-        run(["apt-get", "install", "-y", "--reinstall", "sing-box", "ca-certificates", "curl", "unzip"], check=True, timeout=300)
+        ensure_required_packages()
         install_xray_latest()
         if not CORE.exists():
             raise RuntimeError(f"отсутствует обязательный core-установщик {CORE}")

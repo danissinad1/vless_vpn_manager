@@ -170,6 +170,64 @@ class SubscriptionTests(unittest.TestCase):
         payload = f"# subscription\n{link}\n{link}\n".encode()
         self.assertEqual(MANAGER.extract_subscription_links(payload), [link])
 
+    def test_extracts_separately_base64_encoded_subscription_lines(self):
+        links = [
+            f"vless://00000000-0000-0000-0000-{index:012d}@node{index}.example.com:443?security=tls&type=tcp#{index}"
+            for index in range(1, 8)
+        ]
+        payload = "\n".join(
+            base64.urlsafe_b64encode(link.encode()).decode().rstrip("=")
+            for link in links
+        ).encode()
+
+        self.assertEqual(MANAGER.extract_subscription_links(payload), links)
+
+    def test_extracts_line_wrapped_base64_subscription(self):
+        links = [
+            "vless://first@example.com:443?security=tls&type=tcp#one",
+            "vless://second@example.net:8443?security=reality&type=tcp&pbk=abc#two",
+        ]
+        encoded = base64.urlsafe_b64encode(("\n".join(links) + "\n").encode()).decode().rstrip("=")
+        payload = "\n".join(encoded[index:index + 76] for index in range(0, len(encoded), 76)).encode()
+
+        self.assertEqual(MANAGER.extract_subscription_links(payload), links)
+
+    def test_fetch_sends_stable_hwid_for_device_limited_subscriptions(self):
+        link = "vless://first@example.com:443?security=tls&type=tcp#one"
+        payload = base64.urlsafe_b64encode((link + "\n").encode())
+        requests = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def geturl(self):
+                return "https://example.com/subscription-token"
+
+            def read(self, _size):
+                return payload
+
+        def fake_urlopen(request, timeout):
+            self.assertEqual(timeout, 30)
+            requests.append(request)
+            return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            with patch.object(MANAGER, "STATE_DIR", state_dir), patch.object(
+                MANAGER.urllib.request, "urlopen", fake_urlopen
+            ):
+                self.assertEqual(MANAGER.fetch_subscription("https://example.com/subscription-token"), [link])
+                self.assertEqual(MANAGER.fetch_subscription("https://example.com/subscription-token"), [link])
+
+            hwids = [request.get_header("X-hwid") for request in requests]
+            self.assertRegex(hwids[0], r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+            self.assertEqual(hwids, [hwids[0], hwids[0]])
+            self.assertEqual((state_dir / "subscription-hwid").stat().st_mode & 0o777, 0o600)
+
     def test_skips_incompatible_vless_links_in_mixed_subscription(self):
         unsupported = "vless://plain@example.org:80?security=none&type=tcp#plain"
         supported = "vless://secure@example.com:443?security=tls&type=tcp#secure"

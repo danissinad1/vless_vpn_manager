@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -329,13 +330,30 @@ def extract_subscription_links(payload, with_rejected=False):
     if len(payload) > 5 * 1024 * 1024:
         raise ValueError("подписка больше 5 МБ")
     candidates = [payload.decode("utf-8", errors="ignore")]
-    compact = re.sub(rb"\s+", b"", payload)
-    if compact:
+    encoded_lines = [line.strip() for line in payload.splitlines() if line.strip()]
+    decoded_lines = []
+    for encoded_line in encoded_lines:
         try:
-            padded = compact + b"=" * (-len(compact) % 4)
-            candidates.append(base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore"))
+            padded = encoded_line + b"=" * (-len(encoded_line) % 4)
+            decoded_lines.append(base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore"))
         except Exception:
-            pass
+            decoded_lines = []
+            break
+    decoded_per_line = "\n".join(decoded_lines)
+    decoded_as_records = decoded_lines and all(
+        re.match(r"^[a-z][a-z0-9+.-]*://", text.strip(), flags=re.IGNORECASE)
+        for text in decoded_lines
+    )
+    if decoded_as_records:
+        candidates.append(decoded_per_line)
+    else:
+        compact = re.sub(rb"\s+", b"", payload)
+        if compact:
+            try:
+                padded = compact + b"=" * (-len(compact) % 4)
+                candidates.append(base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore"))
+            except Exception:
+                pass
     links = []
     rejected = []
     seen = set()
@@ -360,11 +378,35 @@ def extract_subscription_links(payload, with_rejected=False):
     return (links, rejected) if with_rejected else links
 
 
+def subscription_hwid():
+    """Return a stable random device ID required by device-limited subscriptions."""
+    path = STATE_DIR / "subscription-hwid"
+    if path.exists():
+        value = path.read_text().strip().lower()
+        try:
+            return str(uuid.UUID(value))
+        except ValueError as exc:
+            raise ValueError(f"некорректный идентификатор подписки в {path}") from exc
+
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    value = str(uuid.uuid4())
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as output:
+        output.write(value + "\n")
+    return value
+
+
 def fetch_subscription(url, with_rejected=False):
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("поддерживаются только HTTP(S)-ссылки подписки")
-    request = urllib.request.Request(url, headers={"User-Agent": "vless-vpn-manager/1.0"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "vless-vpn-manager/1.0",
+            "X-HWID": subscription_hwid(),
+        },
+    )
     with urllib.request.urlopen(request, timeout=30) as response:
         if urlparse(response.geturl()).scheme.lower() not in {"http", "https"}:
             raise ValueError("подписка перенаправила на небезопасную схему URL")

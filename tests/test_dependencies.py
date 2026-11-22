@@ -165,6 +165,16 @@ class SubscriptionTests(unittest.TestCase):
         payload = f"# subscription\n{link}\n{link}\n".encode()
         self.assertEqual(MANAGER.extract_subscription_links(payload), [link])
 
+    def test_skips_incompatible_vless_links_in_mixed_subscription(self):
+        unsupported = "vless://plain@example.org:80?security=none&type=tcp#plain"
+        supported = "vless://secure@example.com:443?security=tls&type=tcp#secure"
+        payload = f"{unsupported}\n{supported}\n".encode()
+
+        links, rejected = MANAGER.extract_subscription_links(payload, with_rejected=True)
+
+        self.assertEqual(links, [supported])
+        self.assertEqual(rejected, [(unsupported, "неподдерживаемая комбинация none/tcp")])
+
 
 class ConnectivityTests(unittest.TestCase):
     def test_classifies_accessible_restricted_and_failed_services(self):
